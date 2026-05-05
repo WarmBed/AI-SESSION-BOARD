@@ -1,5 +1,7 @@
 # AI Session Board
 
+[English](README.md) · [繁體中文](README.zh-TW.md) · [简体中文](README.zh-CN.md)
+
 Real-time dashboard for **Claude Code** and **Codex CLI** sessions on Windows.
 
 ![AI Session Board screenshot](docs/screenshot.png)
