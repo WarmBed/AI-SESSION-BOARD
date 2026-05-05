@@ -53,6 +53,7 @@ struct Session {
     active: bool,
     count: u32,
     waiting: bool,
+    flashing: bool,         // pulse only during first 30s of waiting
     is_subagent: bool,
 }
 
@@ -228,10 +229,13 @@ fn render_table(f: &mut Frame, area: Rect, st: &State) {
     let header = Row::new(vec!["SRC", "PROJECT", "MODEL", "RUN", "LAST", "TOKENS", "COST", "●"])
         .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    // Pulse waiting rows ~1Hz between bright yellow and dim. Tick increments each
-    // redraw (~2x/sec), so divide by 2 for a ~1Hz pulse.
-    let flash_bright = (st.tick / 2) % 2 == 0;
-    let waiting_color = if flash_bright { Color::Yellow } else { Color::Rgb(140, 110, 0) };
+    // Pulse only flashing rows; non-flashing waiting rows stay solid yellow.
+    let flash_dim_phase = (st.tick / 2) % 2 != 0;
+    let solid_yellow = Color::Yellow;
+    let dim_yellow = Color::Rgb(140, 110, 0);
+    let waiting_color = |s: &Session| -> Color {
+        if s.flashing && flash_dim_phase { dim_yellow } else { solid_yellow }
+    };
 
     // Filter subagents according to toggle, then take MAX_SESSIONS rows, then
     // recompute (N) duplicate suffixes on the visible set.
@@ -252,28 +256,28 @@ fn render_table(f: &mut Frame, area: Rect, st: &State) {
     }
 
     let rows: Vec<Row> = visible.iter().map(|s| {
+        let yellow = waiting_color(s);
         let main = if s.waiting {
-            Style::default().fg(waiting_color).add_modifier(Modifier::BOLD)
+            Style::default().fg(yellow).add_modifier(Modifier::BOLD)
         } else if s.active {
             Style::default().fg(Color::White)
         } else {
             Style::default().fg(Color::DarkGray)
         };
         let dot = if s.waiting {
-            Span::styled("●", Style::default().fg(waiting_color))
+            Span::styled("●", Style::default().fg(yellow))
         } else if s.active {
             Span::styled("●", Style::default().fg(Color::Green))
         } else {
             Span::styled("○", Style::default().fg(Color::DarkGray))
         };
-        // count == 0 → unique project; count >= 1 → (N) duplicate label
         let proj_label = if s.count >= 1 {
             format!("{}({})", s.project, s.count)
         } else {
             s.project.clone()
         };
         let run_style = if s.waiting {
-            Style::default().fg(waiting_color)
+            Style::default().fg(yellow)
         } else if s.active {
             Style::default().fg(Color::Green)
         } else {
@@ -432,6 +436,7 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
         let last_secs = (now - e.last_dt).num_seconds().max(0);
         let active = last_secs <= ACTIVE_MINS * 60;
         let waiting = active && last_secs >= 60;
+        let flashing = waiting && last_secs < 90;
         let is_subagent = e.session_id.contains("/subagents/");
         let source = match (e.sources.contains("claude"), e.sources.contains("codex")) {
             (true, true) => "BOTH",
@@ -457,6 +462,7 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
             active,
             count: 0,
             waiting,
+            flashing,
             is_subagent,
         }
     }).collect();
@@ -753,12 +759,14 @@ fn apply_watcher_state(state: &mut State,
     for s in &mut state.sessions {
         if let Some(last) = snap.get(&s.session_id) {
             let secs = now.duration_since(*last).as_secs();
-            if secs < 5 {
-                s.active = true; s.waiting = false;
+            if secs < 60 {
+                // LAST=今 → cooking
+                s.active = true; s.waiting = false; s.flashing = false;
             } else if secs < (ACTIVE_MINS as u64) * 60 {
                 s.active = true; s.waiting = true;
+                s.flashing = secs < 90; // pulse only first 30s of waiting
             } else {
-                s.active = false; s.waiting = false;
+                s.active = false; s.waiting = false; s.flashing = false;
             }
         }
     }

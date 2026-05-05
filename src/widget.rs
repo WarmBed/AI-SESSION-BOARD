@@ -101,7 +101,7 @@ mod win {
         source:  String,
         project: String,
         project_full: String,
-        session_id: String,     // tu's session id; matches watcher key & jsonl path
+        session_id: String,
         model:   String,
         run:     String,
         last:    String,
@@ -110,6 +110,10 @@ mod win {
         active:  bool,
         count:   u32,
         waiting: bool,
+        /// Pulse the row only while it's a *recent* waiting state (LAST < 2m).
+        /// After that, the row stays solid yellow so it doesn't keep flickering
+        /// for the rest of the 15-minute "active" window.
+        flashing: bool,
         is_subagent: bool,
     }
 
@@ -294,21 +298,30 @@ mod win {
                 .cloned()
                 .collect();
 
-            // Overlay watcher data: convert "watch saw a write recently" into
-            // active/waiting flags. Sessions whose JSONL was written <5s ago
-            // are cooking (active+green); 5s..15min ago are waiting (yellow).
+            // Overlay watcher data into active/waiting flags. Thresholds match
+            // what fmt_ago displays as LAST so the row color stays consistent
+            // with what the user reads:
+            //   LAST=今  (< 60s ago)        → cooking (white, green dot)
+            //   LAST=1m..14m                → waiting (yellow). Pulses for the
+            //                                 first 30s of waiting only — long
+            //                                 enough to notice, short enough
+            //                                 not to flicker indefinitely.
+            //   LAST=15m+                   → idle (dim)
             for s in &mut filtered {
                 if let Some(last_write) = watch_snap.get(&s.session_id) {
                     let secs = now_inst.duration_since(*last_write).as_secs();
-                    if secs < 5 {
+                    if secs < 60 {
                         s.active = true;
                         s.waiting = false;
+                        s.flashing = false;
                     } else if secs < (ACTIVE_MINS as u64) * 60 {
                         s.active = true;
                         s.waiting = true;
+                        s.flashing = secs < 90; // flash window: 60s..90s
                     } else {
                         s.active = false;
                         s.waiting = false;
+                        s.flashing = false;
                     }
                 }
             }
@@ -475,6 +488,7 @@ mod win {
                 };
                 // (N) suffix is computed in apply_filter() after subagent/active
                 // filtering, so the numbering reflects only the visible rows.
+                let flashing = waiting && last_secs < 90;
                 Session {
                     source,
                     project: trunc(&project, 18),
@@ -488,6 +502,7 @@ mod win {
                     active,
                     count:   0,
                     waiting,
+                    flashing,
                     is_subagent,
                 }
         }).collect();
@@ -736,9 +751,10 @@ mod win {
                         let ty = ry + 3;
                         if i % 2 == 1 { fill(hdc, 0, ry, bw, rh, C_BG_ALT); }
 
-                        // Choose row text color: waiting > active > idle.
+                        // Row color: pulse only while `flashing` (first 30s of
+                        // waiting); after that, solid yellow until idle.
                         let row_color = if s.waiting {
-                            if flash_bright { C_WAIT } else { C_WAIT_DIM }
+                            if s.flashing && !flash_bright { C_WAIT_DIM } else { C_WAIT }
                         } else if s.active {
                             C_WHITE
                         } else {
