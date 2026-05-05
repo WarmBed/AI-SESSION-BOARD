@@ -1,4 +1,8 @@
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// Always use the "windows" subsystem so launching the binary never pops up a
+// CMD console window, even in debug builds. The TUI variant still works fine
+// when run from an existing terminal because Windows passes the parent's
+// stdin/stdout handles to a windows-subsystem process when one is available.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::env;
 
