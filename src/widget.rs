@@ -448,52 +448,39 @@ mod win {
             if let Some(arr) = json["sessions"].as_array() {
                 for s in arr {
                     let project  = s["project"].as_str().unwrap_or("?").to_string();
+                    let session_id = s["session_id"].as_str().unwrap_or("");
                     let last_str = s["last_activity"].as_str().unwrap_or("");
                     let Ok(last_dt) = chrono::NaiveDateTime::parse_from_str(
                         last_str, "%Y-%m-%d %H:%M:%S") else { continue; };
-
-                    let first_str = s["first_activity"].as_str().unwrap_or(last_str);
-                    let first_dt  = chrono::NaiveDateTime::parse_from_str(
-                        first_str, "%Y-%m-%d %H:%M:%S").unwrap_or(last_dt);
 
                     let tokens = s["totals"]["total_tokens"].as_u64().unwrap_or(0);
                     let cost   = s["totals"]["cost_usd"].as_f64().unwrap_or(0.0);
                     let src    = raw_source(&s["sources"]);
                     let model  = detect_model(&s["models"]);
-                    let is_active = (now - last_dt).num_minutes() <= ACTIVE_MINS;
+
+                    // Per-session JSONL lookup — the file's mtime gives us the real
+                    // streaming completion time, and the last user message gives us
+                    // the real run_start. tu's last_activity alone collapses both to
+                    // the same instant, making RUN = 0s.
+                    let jsonl = jsonl_run_for_session(session_id);
+
+                    // Always populate timing — even for inactive (>15min) sessions
+                    // we want RUN to show the last actual duration, not "--".
+                    let (active_first, active_last, effective_last) = match jsonl {
+                        Some((start, end)) => (Some(start), Some(end), end.max(last_dt)),
+                        None => (Some(last_dt), Some(last_dt), last_dt),
+                    };
 
                     let mut sources = std::collections::HashSet::new();
                     sources.insert(src);
 
                     entries.push((project, ProjEntry {
-                        active_first_dt: if is_active { Some(first_dt) } else { None },
-                        active_last_dt:  if is_active { Some(last_dt) } else { None },
-                        last_dt,
+                        active_first_dt: active_first,
+                        active_last_dt:  active_last,
+                        last_dt: effective_last,
                         tokens, cost, sources, model,
                         count: 1,
                     }));
-                }
-            }
-
-            // Override timing with JSONL mtime — only the most recent .jsonl per
-            // project is matched, so when there are multiple rows for the same
-            // project only the newest gets the JSONL accuracy boost.
-            let jsonl_runs = scan_jsonl_runs();
-            // Pick newest entry per project for the override target.
-            let mut newest_idx_per_project: HashMap<String, usize> = HashMap::new();
-            for (i, (proj, e)) in entries.iter().enumerate() {
-                let take = match newest_idx_per_project.get(proj) {
-                    None => true,
-                    Some(&j) => e.last_dt > entries[j].1.last_dt,
-                };
-                if take { newest_idx_per_project.insert(proj.clone(), i); }
-            }
-            for (proj, &idx) in &newest_idx_per_project {
-                if let Some((start, end)) = jsonl_runs.get(proj) {
-                    let entry = &mut entries[idx].1;
-                    entry.active_first_dt = Some(*start);
-                    entry.active_last_dt = Some(*end);
-                    if *end > entry.last_dt { entry.last_dt = *end; }
                 }
             }
 
@@ -759,71 +746,50 @@ mod win {
         }
     }
 
-    /// Scan ~/.claude/projects/*/  for the most recent JSONL per project.
-    /// Returns project_name -> (run_start, run_end).
-    /// run_start = timestamp of last user message (when current task began).
-    /// run_end   = file mtime (Claude updates file as it streams, so mtime ≈ last token).
-    fn scan_jsonl_runs() -> HashMap<String, (chrono::NaiveDateTime, chrono::NaiveDateTime)> {
+    /// Look up a single tu session_id's JSONL file and return (run_start, run_end).
+    ///
+    /// `session_id` from `tu session -j` looks like:
+    ///   - "d--code-psmux/UUID"                           (main conversation)
+    ///   - "d--code-psmux/UUID/subagents/agent-XXXX"      (subagent)
+    ///
+    /// Both map directly to a JSONL path:
+    ///   ~/.claude/projects/<session_id>.jsonl
+    ///
+    /// run_start = timestamp of the last real user message in that file
+    /// run_end   = file mtime (Claude appends as it streams; mtime ≈ last token written)
+    fn jsonl_run_for_session(session_id: &str)
+        -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)>
+    {
         use chrono::TimeZone;
-        let mut result = HashMap::new();
-        let Ok(home) = std::env::var("USERPROFILE") else { return result };
-        let projects_dir = std::path::PathBuf::from(home).join(".claude").join("projects");
-        let Ok(entries) = std::fs::read_dir(&projects_dir) else { return result };
+        let home = std::env::var("USERPROFILE").ok()?;
+        let rel = session_id.replace('/', "\\");
+        let path = format!(r"{}\.claude\projects\{}.jsonl", home, rel);
+        let path = std::path::PathBuf::from(path);
 
-        for entry in entries.flatten() {
-            let proj_path = entry.path();
-            if !proj_path.is_dir() { continue; }
-            let raw_name = entry.file_name().to_string_lossy().to_string();
-            let project = decode_project_name(&raw_name);
+        let meta = std::fs::metadata(&path).ok()?;
+        let mtime_sys = meta.modified().ok()?;
 
-            // Find the most recently modified .jsonl in this project dir
-            let Ok(files) = std::fs::read_dir(&proj_path) else { continue };
-            let mut best: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
-            for f in files.flatten() {
-                let p = f.path();
-                if p.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
-                let Ok(meta) = f.metadata() else { continue };
-                let Ok(mtime) = meta.modified() else { continue };
-                match &best {
-                    None => best = Some((p, mtime)),
-                    Some((_, prev)) if mtime > *prev => best = Some((p, mtime)),
-                    _ => {}
-                }
-            }
-            let Some((path, mtime_sys)) = best else { continue };
-
-            // Find the LAST REAL user message timestamp in the file.
-            // Claude Code stores tool results as type="user" too — those must be
-            // skipped, otherwise every tool-call result resets run_start and the
-            // displayed RUN stays at a few seconds even during 45-minute tasks.
-            let Ok(content) = std::fs::read_to_string(&path) else { continue };
-            let mut last_user_utc: Option<chrono::DateTime<chrono::Utc>> = None;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() { continue; }
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-                if v["type"].as_str() != Some("user") { continue; }
-                if !is_real_user_input(&v["message"]["content"]) { continue; }
-                let Some(ts) = v["timestamp"].as_str() else { continue };
-                let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) else { continue };
-                last_user_utc = Some(dt.with_timezone(&chrono::Utc));
-            }
-            let Some(start_utc) = last_user_utc else { continue };
-
-            // mtime → local naive
-            let Ok(unix) = mtime_sys.duration_since(std::time::UNIX_EPOCH) else { continue };
-            let Some(end_local) = chrono::Local.timestamp_opt(unix.as_secs() as i64, 0).single()
-            else { continue };
-            // start_utc → local naive
-            let start_local = start_utc.with_timezone(&chrono::Local).naive_local();
-            let end_naive = end_local.naive_local();
-
-            // Guard: if mtime is before run_start (race / older response), skip
-            if end_naive < start_local { continue; }
-
-            result.insert(project, (start_local, end_naive));
+        let content = std::fs::read_to_string(&path).ok()?;
+        let mut last_user_utc: Option<chrono::DateTime<chrono::Utc>> = None;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if v["type"].as_str() != Some("user") { continue; }
+            if !is_real_user_input(&v["message"]["content"]) { continue; }
+            let Some(ts) = v["timestamp"].as_str() else { continue };
+            let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) else { continue };
+            last_user_utc = Some(dt.with_timezone(&chrono::Utc));
         }
-        result
+        let start_utc = last_user_utc?;
+
+        let unix = mtime_sys.duration_since(std::time::UNIX_EPOCH).ok()?;
+        let end_local = chrono::Local.timestamp_opt(unix.as_secs() as i64, 0).single()?;
+        let start_local = start_utc.with_timezone(&chrono::Local).naive_local();
+        let end_naive = end_local.naive_local();
+
+        if end_naive < start_local { return None; }
+        Some((start_local, end_naive))
     }
 
     /// True only for messages the human actually typed.

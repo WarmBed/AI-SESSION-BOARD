@@ -485,49 +485,35 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
     if let Some(arr) = json["sessions"].as_array() {
         for s in arr {
             let project = s["project"].as_str().unwrap_or("?").to_string();
+            let session_id = s["session_id"].as_str().unwrap_or("");
             let last_str = s["last_activity"].as_str().unwrap_or("");
             let Ok(last_dt) = chrono::NaiveDateTime::parse_from_str(last_str, "%Y-%m-%d %H:%M:%S")
             else { continue; };
-            let first_str = s["first_activity"].as_str().unwrap_or(last_str);
-            let first_dt = chrono::NaiveDateTime::parse_from_str(first_str, "%Y-%m-%d %H:%M:%S")
-                .unwrap_or(last_dt);
 
             let tokens = s["totals"]["total_tokens"].as_u64().unwrap_or(0);
             let cost = s["totals"]["cost_usd"].as_f64().unwrap_or(0.0);
             let src = source_of(&s["sources"]);
             let model = detect_model(&s["models"]);
-            let is_active = (now - last_dt).num_minutes() <= ACTIVE_MINS;
+
+            // Per-session JSONL — gives accurate run_start (last real user msg)
+            // and run_end (file mtime). Without this, tu only has last_activity
+            // which collapses RUN to 0s.
+            let (active_first, active_last, effective_last) =
+                match jsonl_run_for_session(session_id) {
+                    Some((start, end)) => (Some(start), Some(end), end.max(last_dt)),
+                    None => (Some(last_dt), Some(last_dt), last_dt),
+                };
 
             let mut sources = HashSet::new();
             sources.insert(src);
 
             entries.push((project, ProjEntry {
-                active_first_dt: if is_active { Some(first_dt) } else { None },
-                active_last_dt:  if is_active { Some(last_dt) } else { None },
-                last_dt,
+                active_first_dt: active_first,
+                active_last_dt:  active_last,
+                last_dt: effective_last,
                 tokens, cost, sources, model,
                 count: 1,
             }));
-        }
-    }
-
-    // Override timing with JSONL mtime data — only the newest entry per project
-    // gets the boost (we can only match a project to one .jsonl).
-    let jsonl_runs = scan_jsonl_runs();
-    let mut newest_idx_per_project: HashMap<String, usize> = HashMap::new();
-    for (i, (proj, e)) in entries.iter().enumerate() {
-        let take = match newest_idx_per_project.get(proj) {
-            None => true,
-            Some(&j) => e.last_dt > entries[j].1.last_dt,
-        };
-        if take { newest_idx_per_project.insert(proj.clone(), i); }
-    }
-    for (proj, &idx) in &newest_idx_per_project {
-        if let Some((start, end)) = jsonl_runs.get(proj) {
-            let entry = &mut entries[idx].1;
-            entry.active_first_dt = Some(*start);
-            entry.active_last_dt = Some(*end);
-            if *end > entry.last_dt { entry.last_dt = *end; }
         }
     }
 
@@ -667,57 +653,39 @@ fn detect_model(v: &serde_json::Value) -> String {
     key.chars().take(8).collect::<String>().to_uppercase()
 }
 
-fn scan_jsonl_runs() -> HashMap<String, (chrono::NaiveDateTime, chrono::NaiveDateTime)> {
-    let mut result = HashMap::new();
-    let Ok(home) = std::env::var("USERPROFILE") else { return result };
-    let projects_dir = std::path::PathBuf::from(home).join(".claude").join("projects");
-    let Ok(entries) = std::fs::read_dir(&projects_dir) else { return result };
+/// Per-session JSONL lookup. session_id from tu maps directly to a JSONL path
+/// under `~/.claude/projects/`. Returns (run_start, run_end) where
+/// run_start = timestamp of last real user message, run_end = file mtime.
+fn jsonl_run_for_session(session_id: &str)
+    -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)>
+{
+    let home = std::env::var("USERPROFILE").ok()?;
+    let rel = session_id.replace('/', "\\");
+    let path = std::path::PathBuf::from(format!(r"{}\.claude\projects\{}.jsonl", home, rel));
 
-    for entry in entries.flatten() {
-        let proj_path = entry.path();
-        if !proj_path.is_dir() { continue; }
-        let raw_name = entry.file_name().to_string_lossy().to_string();
-        let project = decode_project_name(&raw_name);
+    let meta = std::fs::metadata(&path).ok()?;
+    let mtime_sys = meta.modified().ok()?;
 
-        let Ok(files) = std::fs::read_dir(&proj_path) else { continue };
-        let mut best: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
-        for f in files.flatten() {
-            let p = f.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
-            let Ok(meta) = f.metadata() else { continue };
-            let Ok(mtime) = meta.modified() else { continue };
-            match &best {
-                None => best = Some((p, mtime)),
-                Some((_, prev)) if mtime > *prev => best = Some((p, mtime)),
-                _ => {}
-            }
-        }
-        let Some((path, mtime_sys)) = best else { continue };
-
-        let Ok(content) = std::fs::read_to_string(&path) else { continue };
-        let mut last_user_utc: Option<chrono::DateTime<chrono::Utc>> = None;
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() { continue; }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            if v["type"].as_str() != Some("user") { continue; }
-            if !is_real_user_input(&v["message"]["content"]) { continue; }
-            let Some(ts) = v["timestamp"].as_str() else { continue };
-            let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) else { continue };
-            last_user_utc = Some(dt.with_timezone(&chrono::Utc));
-        }
-        let Some(start_utc) = last_user_utc else { continue };
-
-        let Ok(unix) = mtime_sys.duration_since(std::time::UNIX_EPOCH) else { continue };
-        let Some(end_local) = chrono::Local.timestamp_opt(unix.as_secs() as i64, 0).single()
-        else { continue };
-        let start_local = start_utc.with_timezone(&chrono::Local).naive_local();
-        let end_naive = end_local.naive_local();
-        if end_naive < start_local { continue; }
-
-        result.insert(project, (start_local, end_naive));
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut last_user_utc: Option<chrono::DateTime<chrono::Utc>> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v["type"].as_str() != Some("user") { continue; }
+        if !is_real_user_input(&v["message"]["content"]) { continue; }
+        let Some(ts) = v["timestamp"].as_str() else { continue };
+        let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) else { continue };
+        last_user_utc = Some(dt.with_timezone(&chrono::Utc));
     }
-    result
+    let start_utc = last_user_utc?;
+
+    let unix = mtime_sys.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let end_local = chrono::Local.timestamp_opt(unix.as_secs() as i64, 0).single()?;
+    let start_local = start_utc.with_timezone(&chrono::Local).naive_local();
+    let end_naive = end_local.naive_local();
+    if end_naive < start_local { return None; }
+    Some((start_local, end_naive))
 }
 
 fn is_real_user_input(content: &serde_json::Value) -> bool {
