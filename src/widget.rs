@@ -119,6 +119,14 @@ mod win {
         ("codex",  0x0000DDDD), // yellow-ish (BGR)
     ];
 
+    /// Snapshot produced by the background data worker so the UI thread never
+    /// blocks on `tu session` subprocess calls or JSONL parsing.
+    pub(super) struct Snapshot {
+        all_sessions: Vec<Session>,
+        footer_segs: Vec<(String, u32)>,
+        mtd_cost: f64,
+    }
+
     struct BoardApp {
         hwnd: HWND,
         x: i32, y: i32,
@@ -128,23 +136,24 @@ mod win {
         all_sessions: Vec<Session>,
         sessions: Vec<Session>,
         show_all: bool,
-        footer_segs: Vec<(String, u32)>, // colored quota segments
-        mtd_cost: f64,                 // month-to-date cost from session records
-        last_refresh: Instant,
+        footer_segs: Vec<(String, u32)>,
+        mtd_cost: f64,
         tick: u32,
         opacity: u8,
         scale: f32,
         brightness: f32,
         font:   HFONT,
         font_b: HFONT,
-        show_subagents: bool,   // when false, sessions with "/subagents/" in id are hidden
-        // CPU/RAM charts
+        show_subagents: bool,
         show_charts: bool,
         cpu_history: Vec<Vec<f64>>,
         ram_history: Vec<Vec<f64>>,
         proc_counts: Vec<usize>,
         sample_rx: Option<std::sync::mpsc::Receiver<(Vec<f64>, Vec<f64>, Vec<usize>)>>,
         sample_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        // Background data worker — fetches snapshots without blocking the UI.
+        snapshot_rx: Option<std::sync::mpsc::Receiver<Snapshot>>,
+        data_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl BoardApp {
@@ -152,6 +161,7 @@ mod win {
             let (x, y) = initial_pos();
             let n = CHART_TARGETS.len();
             let (sample_rx, sample_stop) = spawn_proc_sampler();
+            let (snapshot_rx, data_stop) = spawn_data_worker();
             let mut app = BoardApp {
                 hwnd, x, y,
                 dragging: false, drag_offset_x: 0, drag_offset_y: 0,
@@ -160,7 +170,6 @@ mod win {
                 show_all: false,
                 footer_segs: vec![],
                 mtd_cost: 0.0,
-                last_refresh: Instant::now() - Duration::from_secs(10),
                 tick: 0,
                 opacity: 255,
                 scale: 1.0,
@@ -174,9 +183,27 @@ mod win {
                 proc_counts: vec![0; n],
                 sample_rx: Some(sample_rx),
                 sample_stop: Some(sample_stop),
+                snapshot_rx: Some(snapshot_rx),
+                data_stop: Some(data_stop),
             };
             app.rebuild_fonts();
             app
+        }
+
+        /// Drain any new snapshots produced by the background worker. Non-blocking.
+        fn drain_snapshots(&mut self) {
+            let Some(rx) = self.snapshot_rx.as_ref() else { return };
+            let mut got_one = false;
+            while let Ok(snap) = rx.try_recv() {
+                self.all_sessions = snap.all_sessions;
+                self.footer_segs = snap.footer_segs;
+                self.mtd_cost = snap.mtd_cost;
+                got_one = true;
+            }
+            if got_one {
+                self.apply_filter();
+                self.resize_window();
+            }
         }
 
         unsafe fn draw_chart(&self, hdc: *mut std::ffi::c_void,
@@ -368,44 +395,6 @@ mod win {
             self.sessions = filtered;
         }
 
-        fn refresh_quota(&mut self) {
-            // Read tu's live-frame-cache.json directly — same data source as `tu live`
-            let cache = r"C:\Users\mike2\AppData\Local\tokenusage\live-frame-cache.json";
-            let Ok(raw) = std::fs::read(cache) else { return; };
-            let Ok(j) = serde_json::from_slice::<serde_json::Value>(&raw) else { return; };
-
-            let cla_pct  = j["official_claude"]["primary_used_percent"].as_f64().unwrap_or(0.0);
-            let cla_wk   = j["official_claude"]["secondary_used_percent"].as_f64().unwrap_or(0.0);
-            let cod_pct  = j["official_codex"]["primary_used_percent"].as_f64().unwrap_or(0.0);
-            let cod_wk   = j["official_codex"]["secondary_used_percent"].as_f64().unwrap_or(0.0);
-            let today = j["today_totals"]["cost_usd"].as_f64().unwrap_or(0.0);
-
-            let reset_at = j["official_claude"]["primary_resets_at"].as_i64().unwrap_or(0);
-            let now_unix = chrono::Local::now().timestamp();
-            let left = (reset_at - now_unix).max(0);
-            let reset = if left >= 3600 {
-                format!("{}h{}m", left / 3600, (left % 3600) / 60)
-            } else {
-                format!("{}m", left / 60)
-            };
-
-            let cached = j["cached_at_unix"].as_i64().unwrap_or(0);
-            let age_m = (now_unix - cached) / 60;
-            let stale = if age_m > 5 { format!(" !{}m", age_m) } else { String::new() };
-
-            self.footer_segs = vec![
-                ("CC ".into(),                          C_HDR),
-                (format!("{:.0}%", cla_pct),            pct_color(cla_pct)),
-                ("/wk".into(),                          C_HDR),
-                (format!("{:.0}%", cla_wk),             pct_color(cla_wk)),
-                ("  CDX ".into(),                       C_HDR),
-                (format!("{:.0}%", cod_pct),            pct_color(cod_pct)),
-                ("/wk".into(),                          C_HDR),
-                (format!("{:.0}%", cod_wk),             pct_color(cod_wk)),
-                (format!("  RST {}  今${:.0}  MTD${}{}",
-                    reset, today, fmt_kilo(self.mtd_cost), stale), C_HDR),
-            ];
-        }
 
         fn resize_window(&self) {
             unsafe {
@@ -417,50 +406,46 @@ mod win {
         fn on_timer(&mut self) {
             self.tick = self.tick.wrapping_add(1);
             self.drain_samples();
-            if self.last_refresh.elapsed() >= Duration::from_secs(REFRESH_SECS) {
-                self.refresh();
-                self.last_refresh = Instant::now();
-                self.resize_window();
-            }
-            // quota refresh every 30s
-            if self.tick % 30 == 1 { self.refresh_quota(); }
+            self.drain_snapshots();
             unsafe {
                 let hdc = GetDC(self.hwnd);
                 if !hdc.is_null() { self.render(hdc); ReleaseDC(self.hwnd, hdc); }
             }
         }
 
-        fn refresh(&mut self) {
-            let today      = chrono::Local::now().format("%Y%m%d").to_string();
-            let month_start = chrono::Local::now().format("%Y%m01").to_string();
+    } // end impl BoardApp — free helpers below
 
-            // MTD cost: sum all session costs since the 1st of this month
-            if let Ok(mo) = std::process::Command::new("cmd")
-                .args(["/c", "tu", "session", "-j", "--since", &month_start])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-            {
-                let raw_mo = if !mo.stdout.is_empty() { mo.stdout } else { mo.stderr };
-                if let Ok(jm) = serde_json::from_slice::<serde_json::Value>(&raw_mo) {
-                    if let Some(arr) = jm["sessions"].as_array() {
-                        self.mtd_cost = arr.iter()
-                            .map(|s| s["totals"]["cost_usd"].as_f64().unwrap_or(0.0))
-                            .sum();
-                    }
+    /// Build a fresh `Snapshot` (sessions + footer + MTD). Runs entirely in the
+    /// background worker thread so the UI never stalls on `tu` subprocesses or
+    /// JSONL parses.
+    fn build_snapshot() -> Option<Snapshot> {
+        let today_str   = chrono::Local::now().format("%Y%m%d").to_string();
+        let month_start = chrono::Local::now().format("%Y%m01").to_string();
+
+        // MTD cost (sum across this month's tu sessions).
+        let mut mtd_cost = 0.0;
+        if let Ok(mo) = std::process::Command::new("cmd")
+            .args(["/c", "tu", "session", "-j", "--since", &month_start])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            let raw_mo = if !mo.stdout.is_empty() { mo.stdout } else { mo.stderr };
+            if let Ok(jm) = serde_json::from_slice::<serde_json::Value>(&raw_mo) {
+                if let Some(arr) = jm["sessions"].as_array() {
+                    mtd_cost = arr.iter()
+                        .map(|s| s["totals"]["cost_usd"].as_f64().unwrap_or(0.0))
+                        .sum();
                 }
             }
+        }
 
-            let Ok(out) = std::process::Command::new("cmd")
-                .args(["/c", "tu", "session", "-j", "--since", &today])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-            else { return; };
-
-            let raw = if !out.stdout.is_empty() { out.stdout } else { out.stderr };
-            let Ok(json) = serde_json::from_slice::<serde_json::Value>(&raw)
-            else { return; };
-
-            let now = chrono::Local::now().naive_local();
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "tu", "session", "-j", "--since", &today_str])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output().ok()?;
+        let raw = if !out.stdout.is_empty() { out.stdout } else { out.stderr };
+        let json: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        let now = chrono::Local::now().naive_local();
 
             struct ProjEntry {
                 session_id:      String,
@@ -527,7 +512,7 @@ mod win {
                 })
                 .collect();
 
-            self.all_sessions = sorted.into_iter().map(|(project, e, is_subagent)| {
+        let all_sessions: Vec<Session> = sorted.into_iter().map(|(project, e, is_subagent)| {
                 let last_secs = (now - e.last_dt).num_seconds().max(0);
                 let active = last_secs <= ACTIVE_MINS * 60;
                 // "Waiting" = active but not currently streaming. Threshold: a Claude
@@ -561,11 +546,82 @@ mod win {
                     waiting,
                     is_subagent,
                 }
-            }).collect();
+        }).collect();
 
-            self.apply_filter();
-        }
+        // Quota footer (fast — small JSON file).
+        let footer_segs = build_footer_segs(mtd_cost);
 
+        Some(Snapshot { all_sessions, footer_segs, mtd_cost })
+    }
+
+    /// Read the live-frame-cache.json that `tu live` produces and turn it into
+    /// the colored footer segments. Tiny file, safe to read every iteration.
+    fn build_footer_segs(mtd_cost: f64) -> Vec<(String, u32)> {
+        let cache = r"C:\Users\mike2\AppData\Local\tokenusage\live-frame-cache.json";
+        let Ok(raw) = std::fs::read(cache) else { return Vec::new(); };
+        let Ok(j) = serde_json::from_slice::<serde_json::Value>(&raw)
+            else { return Vec::new(); };
+
+        let cla_pct  = j["official_claude"]["primary_used_percent"].as_f64().unwrap_or(0.0);
+        let cla_wk   = j["official_claude"]["secondary_used_percent"].as_f64().unwrap_or(0.0);
+        let cod_pct  = j["official_codex"]["primary_used_percent"].as_f64().unwrap_or(0.0);
+        let cod_wk   = j["official_codex"]["secondary_used_percent"].as_f64().unwrap_or(0.0);
+        let today    = j["today_totals"]["cost_usd"].as_f64().unwrap_or(0.0);
+
+        let reset_at = j["official_claude"]["primary_resets_at"].as_i64().unwrap_or(0);
+        let now_unix = chrono::Local::now().timestamp();
+        let left = (reset_at - now_unix).max(0);
+        let reset = if left >= 3600 {
+            format!("{}h{}m", left / 3600, (left % 3600) / 60)
+        } else { format!("{}m", left / 60) };
+
+        let cached = j["cached_at_unix"].as_i64().unwrap_or(0);
+        let age_m = (now_unix - cached) / 60;
+        let stale = if age_m > 5 { format!(" !{}m", age_m) } else { String::new() };
+
+        vec![
+            ("CC ".into(),                          C_HDR),
+            (format!("{:.0}%", cla_pct),            pct_color(cla_pct)),
+            ("/wk".into(),                          C_HDR),
+            (format!("{:.0}%", cla_wk),             pct_color(cla_wk)),
+            ("  CDX ".into(),                       C_HDR),
+            (format!("{:.0}%", cod_pct),            pct_color(cod_pct)),
+            ("/wk".into(),                          C_HDR),
+            (format!("{:.0}%", cod_wk),             pct_color(cod_wk)),
+            (format!("  RST {}  今${:.0}  MTD${}{}",
+                reset, today, fmt_kilo(mtd_cost), stale), C_HDR),
+        ]
+    }
+
+    /// Background worker thread — produces snapshots every REFRESH_SECS without
+    /// blocking the UI thread. The UI thread polls the Receiver via try_recv.
+    fn spawn_data_worker() -> (
+        std::sync::mpsc::Receiver<Snapshot>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<Snapshot>();
+        let stop_w = stop.clone();
+        std::thread::spawn(move || {
+            // Initial fetch immediately so the UI shows data within ~1 cycle.
+            if let Some(snap) = build_snapshot() {
+                if tx.send(snap).is_err() { return; }
+            }
+            loop {
+                if stop_w.load(Ordering::Relaxed) { break; }
+                std::thread::sleep(Duration::from_secs(REFRESH_SECS));
+                if stop_w.load(Ordering::Relaxed) { break; }
+                if let Some(snap) = build_snapshot() {
+                    if tx.send(snap).is_err() { break; }
+                }
+            }
+        });
+        (rx, stop)
+    }
+
+    impl BoardApp {
         fn start_drag(&mut self, rel_x: i32, rel_y: i32) {
             self.dragging = true;
             self.drag_offset_x = rel_x;
