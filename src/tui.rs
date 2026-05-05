@@ -54,6 +54,8 @@ struct Session {
     cost: f64,
     active: bool,
     count: u32,
+    /// Active but not currently streaming: agent stopped, awaiting user reply.
+    waiting: bool,
 }
 
 struct State {
@@ -66,6 +68,7 @@ struct State {
     ram_history: Vec<Vec<f64>>,
     proc_counts: Vec<usize>,
     show_charts: bool,    // toggleable with `c`
+    tick: u64,            // increments each redraw — drives waiting-row flash
 }
 
 #[derive(Clone, Default)]
@@ -103,6 +106,7 @@ pub fn run() -> io::Result<()> {
         ram_history: vec![vec![0.0; HISTORY_LEN]; n],
         proc_counts: vec![0; n],
         show_charts: true,
+        tick: 0,
     };
 
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -200,6 +204,7 @@ pub fn run() -> io::Result<()> {
                 state.proc_counts = s.counts;
             }
 
+            state.tick = state.tick.wrapping_add(1);
             term.draw(|f| render(f, &state))?;
 
             // Wait ~500ms for the next frame, processing keys as they come.
@@ -357,23 +362,35 @@ fn render_table(f: &mut Frame, area: Rect, st: &State) {
     let header = Row::new(vec!["SRC", "PROJECT", "MODEL", "RUN", "LAST", "TOKENS", "COST", "●"])
         .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
+    // Pulse waiting rows ~1Hz between bright yellow and dim. Tick increments each
+    // redraw (~2x/sec), so divide by 2 for a ~1Hz pulse.
+    let flash_bright = (st.tick / 2) % 2 == 0;
+    let waiting_color = if flash_bright { Color::Yellow } else { Color::Rgb(140, 110, 0) };
+
     let rows: Vec<Row> = st.sessions.iter().take(MAX_SESSIONS).map(|s| {
-        let main = if s.active {
+        let main = if s.waiting {
+            Style::default().fg(waiting_color).add_modifier(Modifier::BOLD)
+        } else if s.active {
             Style::default().fg(Color::White)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let dot = if s.active {
+        let dot = if s.waiting {
+            Span::styled("●", Style::default().fg(waiting_color))
+        } else if s.active {
             Span::styled("●", Style::default().fg(Color::Green))
         } else {
             Span::styled("○", Style::default().fg(Color::DarkGray))
         };
-        let proj_label = if s.count > 1 {
+        // count == 0 → unique project; count >= 1 → (N) duplicate label
+        let proj_label = if s.count >= 1 {
             format!("{}({})", s.project, s.count)
         } else {
             s.project.clone()
         };
-        let run_style = if s.active {
+        let run_style = if s.waiting {
+            Style::default().fg(waiting_color)
+        } else if s.active {
             Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::DarkGray)
@@ -462,7 +479,8 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
         model: String,
         count: u32,
     }
-    let mut by_project: HashMap<String, ProjEntry> = HashMap::new();
+    // Each tu session entry becomes its own row — no aggregation by project.
+    let mut entries: Vec<(String, ProjEntry)> = Vec::new();
 
     if let Some(arr) = json["sessions"].as_array() {
         for s in arr {
@@ -480,46 +498,52 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
             let model = detect_model(&s["models"]);
             let is_active = (now - last_dt).num_minutes() <= ACTIVE_MINS;
 
-            let e = by_project.entry(project).or_insert(ProjEntry {
-                active_first_dt: None, active_last_dt: None,
-                last_dt, tokens: 0, cost: 0.0,
-                sources: HashSet::new(),
-                model: model.clone(), count: 0,
-            });
-            e.tokens += tokens;
-            e.cost += cost;
-            e.sources.insert(src);
-            if last_dt > e.last_dt { e.last_dt = last_dt; e.model = model; }
+            let mut sources = HashSet::new();
+            sources.insert(src);
 
-            if is_active {
-                e.count += 1;
-                e.active_first_dt = Some(match e.active_first_dt {
-                    Some(prev) => prev.min(first_dt),
-                    None => first_dt,
-                });
-                e.active_last_dt = Some(match e.active_last_dt {
-                    Some(prev) => prev.max(last_dt),
-                    None => last_dt,
-                });
-            }
+            entries.push((project, ProjEntry {
+                active_first_dt: if is_active { Some(first_dt) } else { None },
+                active_last_dt:  if is_active { Some(last_dt) } else { None },
+                last_dt,
+                tokens, cost, sources, model,
+                count: 1,
+            }));
         }
     }
 
-    // Override timing with JSONL mtime data
+    // Override timing with JSONL mtime data — only the newest entry per project
+    // gets the boost (we can only match a project to one .jsonl).
     let jsonl_runs = scan_jsonl_runs();
-    for (project, entry) in by_project.iter_mut() {
-        if let Some((start, end)) = jsonl_runs.get(project) {
+    let mut newest_idx_per_project: HashMap<String, usize> = HashMap::new();
+    for (i, (proj, e)) in entries.iter().enumerate() {
+        let take = match newest_idx_per_project.get(proj) {
+            None => true,
+            Some(&j) => e.last_dt > entries[j].1.last_dt,
+        };
+        if take { newest_idx_per_project.insert(proj.clone(), i); }
+    }
+    for (proj, &idx) in &newest_idx_per_project {
+        if let Some((start, end)) = jsonl_runs.get(proj) {
+            let entry = &mut entries[idx].1;
             entry.active_first_dt = Some(*start);
             entry.active_last_dt = Some(*end);
             if *end > entry.last_dt { entry.last_dt = *end; }
         }
     }
 
-    let mut sorted: Vec<(String, ProjEntry)> = by_project.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.last_dt.cmp(&a.1.last_dt));
+    entries.sort_by(|a, b| b.1.last_dt.cmp(&a.1.last_dt));
+    let sorted: Vec<(String, ProjEntry)> = entries.into_iter().take(MAX_SESSIONS).collect();
 
-    let all: Vec<Session> = sorted.into_iter().take(MAX_SESSIONS).map(|(project, e)| {
-        let active = (now - e.last_dt).num_minutes() <= ACTIVE_MINS;
+    let mut project_total: HashMap<String, u32> = HashMap::new();
+    for (proj, _) in &sorted {
+        *project_total.entry(proj.clone()).or_insert(0) += 1;
+    }
+    let mut project_seen: HashMap<String, u32> = HashMap::new();
+
+    let all: Vec<Session> = sorted.into_iter().map(|(project, e)| {
+        let last_secs = (now - e.last_dt).num_seconds().max(0);
+        let active = last_secs <= ACTIVE_MINS * 60;
+        let waiting = active && last_secs >= 60;
         let source = match (e.sources.contains("claude"), e.sources.contains("codex")) {
             (true, true) => "BOTH",
             (true, false) => "CLAUDE",
@@ -530,6 +554,12 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
             (Some(start), Some(end)) => fmt_duration((end - start).num_seconds().max(0)),
             _ => "--".into(),
         };
+        // (N) suffix only if multiple rows share this project
+        let total = project_total.get(&project).copied().unwrap_or(1);
+        let suffix_n = if total > 1 {
+            let n = project_seen.entry(project.clone()).and_modify(|v| *v += 1).or_insert(1);
+            *n
+        } else { 0 };
         Session {
             source,
             project: trunc(&project, 22),
@@ -539,7 +569,8 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
             tokens: fmt_tokens(e.tokens),
             cost: e.cost,
             active,
-            count: e.count,
+            count: suffix_n,    // 0 = no suffix; 1+ = (N) duplicate label
+            waiting,
         }
     }).collect();
 

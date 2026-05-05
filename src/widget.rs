@@ -73,6 +73,8 @@ mod win {
     const C_COST:    u32 = 0xA0A0A0;
     const C_DIM:     u32 = 0x606060;
     const C_AMBER:   u32 = 0x00BBFF;  // >50%: yellow (BGR)
+    const C_WAIT:    u32 = 0x00DDFF;  // waiting-for-user yellow (BGR)
+    const C_WAIT_DIM:u32 = 0x008CB0;  // dim phase for flashing
     const C_RED:     u32 = 0x3030FF;  // >90%: red (BGR)
 
     const TIMER_ID:     usize = 1;
@@ -104,6 +106,9 @@ mod win {
         cost:    f64,
         active:  bool,
         count:   u32,
+        /// Active session whose last activity is between 60s and ACTIVE_MINS:
+        /// agent has stopped streaming and is waiting for the user to reply.
+        waiting: bool,
     }
 
     // ─── App ──────────────────────────────────────────────────────────────────
@@ -435,7 +440,10 @@ mod win {
                 model:           String,
                 count:           u32,
             }
-            let mut by_project: HashMap<String, ProjEntry> = HashMap::new();
+            // Each tu session entry becomes its own row — no aggregation by project.
+            // Two sessions in `code/psmux` will appear as two rows; the labeller
+            // below adds (1)/(2) suffixes when there are duplicates.
+            let mut entries: Vec<(String, ProjEntry)> = Vec::new();
 
             if let Some(arr) = json["sessions"].as_array() {
                 for s in arr {
@@ -454,50 +462,59 @@ mod win {
                     let model  = detect_model(&s["models"]);
                     let is_active = (now - last_dt).num_minutes() <= ACTIVE_MINS;
 
-                    let e = by_project.entry(project).or_insert(ProjEntry {
-                        active_first_dt: None, active_last_dt: None,
-                        last_dt, tokens: 0, cost: 0.0,
-                        sources: std::collections::HashSet::new(),
-                        model: model.clone(), count: 0,
-                    });
-                    e.tokens += tokens;
-                    e.cost   += cost;
-                    e.sources.insert(src);
-                    if last_dt > e.last_dt { e.last_dt = last_dt; e.model = model; }
+                    let mut sources = std::collections::HashSet::new();
+                    sources.insert(src);
 
-                    if is_active {
-                        e.count += 1;
-                        e.active_first_dt = Some(match e.active_first_dt {
-                            Some(prev) => prev.min(first_dt),
-                            None       => first_dt,
-                        });
-                        e.active_last_dt = Some(match e.active_last_dt {
-                            Some(prev) => prev.max(last_dt),
-                            None       => last_dt,
-                        });
-                    }
+                    entries.push((project, ProjEntry {
+                        active_first_dt: if is_active { Some(first_dt) } else { None },
+                        active_last_dt:  if is_active { Some(last_dt) } else { None },
+                        last_dt,
+                        tokens, cost, sources, model,
+                        count: 1,
+                    }));
                 }
             }
 
-            // Override tu-based timing with JSONL mtime-based timing (more accurate
-            // for Claude — captures actual streaming completion, not just message
-            // start). Only Claude is covered; Codex projects keep tu data.
+            // Override timing with JSONL mtime — only the most recent .jsonl per
+            // project is matched, so when there are multiple rows for the same
+            // project only the newest gets the JSONL accuracy boost.
             let jsonl_runs = scan_jsonl_runs();
-            for (project, entry) in by_project.iter_mut() {
-                if let Some((start, end)) = jsonl_runs.get(project) {
-                    // Always set — even for inactive sessions we want to keep the
-                    // last RUN visible (otherwise the row goes grey AND loses RUN).
+            // Pick newest entry per project for the override target.
+            let mut newest_idx_per_project: HashMap<String, usize> = HashMap::new();
+            for (i, (proj, e)) in entries.iter().enumerate() {
+                let take = match newest_idx_per_project.get(proj) {
+                    None => true,
+                    Some(&j) => e.last_dt > entries[j].1.last_dt,
+                };
+                if take { newest_idx_per_project.insert(proj.clone(), i); }
+            }
+            for (proj, &idx) in &newest_idx_per_project {
+                if let Some((start, end)) = jsonl_runs.get(proj) {
+                    let entry = &mut entries[idx].1;
                     entry.active_first_dt = Some(*start);
                     entry.active_last_dt = Some(*end);
                     if *end > entry.last_dt { entry.last_dt = *end; }
                 }
             }
 
-            let mut sorted: Vec<(String, ProjEntry)> = by_project.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.last_dt.cmp(&a.1.last_dt));
+            entries.sort_by(|a, b| b.1.last_dt.cmp(&a.1.last_dt));
+            let sorted: Vec<(String, ProjEntry)> = entries.into_iter().take(MAX_SESSIONS).collect();
 
-            self.all_sessions = sorted.into_iter().take(MAX_SESSIONS).map(|(project, e)| {
-                let active = (now - e.last_dt).num_minutes() <= ACTIVE_MINS;
+            // Build per-project counts so we know which projects need (N) suffixes.
+            let mut project_total: HashMap<String, u32> = HashMap::new();
+            for (proj, _) in &sorted {
+                *project_total.entry(proj.clone()).or_insert(0) += 1;
+            }
+            let mut project_seen: HashMap<String, u32> = HashMap::new();
+
+            self.all_sessions = sorted.into_iter().map(|(project, e)| {
+                let last_secs = (now - e.last_dt).num_seconds().max(0);
+                let active = last_secs <= ACTIVE_MINS * 60;
+                // "Waiting" = active but not currently streaming. Threshold: a Claude
+                // turn that finished within the last few seconds still counts as
+                // running; once mtime hasn't advanced for 60s, the agent has clearly
+                // stopped and is awaiting user input.
+                let waiting = active && last_secs >= 60;
                 let source = match (e.sources.contains("claude"), e.sources.contains("codex")) {
                     (true,  true)  => "BOTH".into(),
                     (true,  false) => "CLAUDE".into(),
@@ -508,6 +525,15 @@ mod win {
                     (Some(start), Some(end)) => fmt_duration((end - start).num_seconds().max(0)),
                     _ => "--".into(),
                 };
+                // Add (N) suffix only when there are duplicates of this project.
+                // First occurrence of a duplicated project becomes (1), the next (2), etc.
+                let total = project_total.get(&project).copied().unwrap_or(1);
+                let suffix_n = if total > 1 {
+                    let n = project_seen.entry(project.clone()).and_modify(|v| *v += 1).or_insert(1);
+                    Some(*n)
+                } else {
+                    None
+                };
                 Session {
                     source,
                     project: trunc(&project, 18),
@@ -517,7 +543,8 @@ mod win {
                     tokens:  fmt_tokens(e.tokens),
                     cost:    e.cost,
                     active,
-                    count:   e.count,
+                    count:   suffix_n.unwrap_or(0),  // 0 = no suffix; 1+ = (N)
+                    waiting,
                 }
             }).collect();
 
@@ -609,31 +636,50 @@ mod win {
                               else { "  NO ACTIVE SESSIONS (右クリック→24H)" };
                     txt(hdc, self.cx(CX_SRC), y_data + 4, msg);
                 } else {
+                    // Tick alternates each second so waiting rows pulse between
+                    // bright and dim yellow.
+                    let flash_bright = (self.tick / 1) % 2 == 0;
                     for (i, s) in self.sessions.iter().enumerate() {
                         let ry = y_data + i as i32 * rh;
                         let ty = ry + 3;
                         if i % 2 == 1 { fill(hdc, 0, ry, bw, rh, C_BG_ALT); }
 
-                        let text_col = self.bright(if s.active { C_WHITE } else { C_DIM });
+                        // Choose row text color: waiting > active > idle.
+                        let row_color = if s.waiting {
+                            if flash_bright { C_WAIT } else { C_WAIT_DIM }
+                        } else if s.active {
+                            C_WHITE
+                        } else {
+                            C_DIM
+                        };
+                        let text_col = self.bright(row_color);
                         SetTextColor(hdc, text_col);
                         txt(hdc, self.cx(CX_SRC),     ty, &s.source);
-                        let suffix = if s.count > 1 { format!("({})", s.count) } else { String::new() };
+                        // count == 0 → unique project (no suffix); count >= 1 → "(N)" duplicate label
+                        let suffix = if s.count >= 1 { format!("({})", s.count) } else { String::new() };
                         let proj_label = format!("{}{}", trunc(&s.project, 18 - suffix.len()), suffix);
                         txt(hdc, self.cx(CX_PROJECT),  ty, &proj_label);
                         txt(hdc, self.cx(CX_MODEL),    ty, &s.model);
 
-                        // RUN column: bright if active
-                        SetTextColor(hdc, self.bright(if s.active { C_ACTIVE } else { C_DIM }));
+                        // RUN column: green when running, yellow when waiting, dim otherwise
+                        let run_col = if s.waiting { row_color }
+                            else if s.active { C_ACTIVE } else { C_DIM };
+                        SetTextColor(hdc, self.bright(run_col));
                         txt(hdc, self.cx(CX_RUN),  ty, &s.run);
 
                         SetTextColor(hdc, text_col);
                         txt(hdc, self.cx(CX_LAST),   ty, &s.last);
                         txt(hdc, self.cx(CX_TOKENS), ty, &s.tokens);
 
-                        SetTextColor(hdc, self.bright(if s.active { C_COST } else { C_IDLE }));
+                        let cost_col = if s.waiting { row_color }
+                            else if s.active { C_COST } else { C_IDLE };
+                        SetTextColor(hdc, self.bright(cost_col));
                         txt(hdc, self.cx(CX_COST), ty, &format!("{:.2}", s.cost));
 
-                        SetTextColor(hdc, self.bright(if s.active { C_ACTIVE } else { C_IDLE }));
+                        // Indicator dot: green ● running, yellow ● waiting, grey ○ idle
+                        let dot_col = if s.waiting { row_color }
+                            else if s.active { C_ACTIVE } else { C_IDLE };
+                        SetTextColor(hdc, self.bright(dot_col));
                         txt(hdc, self.cx(CX_DOT), ty,
                             if s.active { "\u{25CF}" } else { "\u{25CB}" });
                     }

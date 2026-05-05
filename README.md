@@ -2,26 +2,23 @@
 
 Real-time dashboard for **Claude Code** and **Codex CLI** sessions on Windows.
 
+![AI Session Board screenshot](docs/screenshot.png)
+
 Two render targets in one binary:
 - **Floating Win32 overlay** — always-on-top, draggable, never steals keyboard focus
 - **In-terminal TUI** — pin it to a tmux/psmux pane
 
 Shows per-project session activity, accurate task-run duration, OAuth quota usage, month-to-date cost, and live CPU/RAM charts for `claude*` and `codex*` processes.
 
-```
-■ AI SESSION BOARD ■                                                  09:12:58
-SRC     PROJECT          MODEL    RUN     LAST    TOKENS   COST     ●
-CLAUDE  code/psmux       OPS4.7   3m      今      48.9M    28.10    ●
-CLAUDE  code/dragonfly   SNT4.6   1m      1m      29.1M    13.51    ●
-CLAUDE  code/openrouter  OPS4.7   32s     今      27.9M    20.58    ●
-CLAUDE  mike2            SNT4.6   0s      3m       6.5M     2.54    ●
-┌─ CPU %  ●claude 12.3%  ●codex 0.5% ─┐ ┌─ RAM %  ●claude 8.7%  ●codex 1.2% ─┐
-│                                      │ │                                     │
-│       /\        /\                   │ │ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ │
-│  ____/  \______/  \________          │ │                                     │
-└──────────────────────────────────────┘ └─────────────────────────────────────┘
-CC 11%/wk42%  CDX 0%/wk98%  RST 3h56m  今$222  MTD$1.3K
-```
+## At-a-glance status
+
+| Indicator | Meaning |
+|---|---|
+| Green ● + green RUN | Agent is currently streaming tokens |
+| **Yellow ● + flashing row** | Agent has stopped — **waiting for user input** |
+| Grey ○ + dim row | Idle (no activity in last 15 min) |
+
+Sessions for the same project show as separate rows labeled `(1)`, `(2)` etc., so you can tell concurrent conversations apart at a glance.
 
 ## Install
 
@@ -59,13 +56,15 @@ ai-board -h           # help
 ### Floating window
 
 - Drag anywhere on the window to move
-- Right-click for context menu:
-  - Toggle 24H / Active Only
-  - Charts on / off
-  - Opacity (40% / 70% / 100%)
-  - Brightness (80% / 100% / 130% / 160%)
-  - Size (50% / 75% / 100% / 150% / 200%)
-  - Close
+- Right-click for the context menu:
+  - **24H / Active Only** — show today's full history vs only sessions active in the last 15 min
+  - **Charts ON / OFF** — toggle CPU/RAM chart panel
+  - **Opacity** — 40% / 70% / 100%
+  - **Brightness** — 80% / 100% / 130% / 160% (multiplies all text colors)
+  - **Size** — 50% / 75% / 100% / 150% / 200% (DPI-style scale)
+  - **Close**
+
+The window has `WS_EX_NOACTIVATE` so clicking on it never steals keyboard focus from your active terminal.
 
 ## Data sources
 
