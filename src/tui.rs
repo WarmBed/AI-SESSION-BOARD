@@ -47,15 +47,16 @@ const TARGETS: &[(&str, Color)] = &[("claude", Color::Cyan), ("codex", Color::Ye
 struct Session {
     source: String,
     project: String,
+    project_full: String,   // untruncated, used for duplicate counting after filter
     model: String,
     run: String,
     last: String,
     tokens: String,
     cost: f64,
     active: bool,
-    count: u32,
-    /// Active but not currently streaming: agent stopped, awaiting user reply.
+    count: u32,             // (N) suffix; 0 = none. Set in render after filtering.
     waiting: bool,
+    is_subagent: bool,
 }
 
 struct State {
@@ -68,6 +69,7 @@ struct State {
     ram_history: Vec<Vec<f64>>,
     proc_counts: Vec<usize>,
     show_charts: bool,    // toggleable with `c`
+    show_subagents: bool, // toggleable with `s`
     tick: u64,            // increments each redraw — drives waiting-row flash
 }
 
@@ -106,6 +108,7 @@ pub fn run() -> io::Result<()> {
         ram_history: vec![vec![0.0; HISTORY_LEN]; n],
         proc_counts: vec![0; n],
         show_charts: true,
+        show_subagents: false,
         tick: 0,
     };
 
@@ -232,6 +235,10 @@ pub fn run() -> io::Result<()> {
                                     state.show_charts = !state.show_charts;
                                     break;
                                 }
+                                KeyCode::Char('s') => {
+                                    state.show_subagents = !state.show_subagents;
+                                    break;
+                                }
                                 _ => {}
                             }
                         }
@@ -348,7 +355,7 @@ fn render_title(f: &mut Frame, area: Rect, st: &State) {
     let load = if st.loading { " ⏳" } else { "" };
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
     let left = format!("■ AI SESSION BOARD ■{}{}", mode, load);
-    let right = format!("{}    q quit · a 24H · c chart · r refresh", now);
+    let right = format!("{}    q quit · a 24H · c chart · s subagent · r refresh", now);
     let pad = area.width.saturating_sub(left.len() as u16 + right.len() as u16) as usize;
     let line = Line::from(vec![
         Span::styled(left, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -367,7 +374,25 @@ fn render_table(f: &mut Frame, area: Rect, st: &State) {
     let flash_bright = (st.tick / 2) % 2 == 0;
     let waiting_color = if flash_bright { Color::Yellow } else { Color::Rgb(140, 110, 0) };
 
-    let rows: Vec<Row> = st.sessions.iter().take(MAX_SESSIONS).map(|s| {
+    // Filter subagents according to toggle, then take MAX_SESSIONS rows, then
+    // recompute (N) duplicate suffixes on the visible set.
+    let mut visible: Vec<Session> = st.sessions.iter()
+        .filter(|s| st.show_subagents || !s.is_subagent)
+        .take(MAX_SESSIONS)
+        .cloned()
+        .collect();
+    let mut totals: HashMap<String, u32> = HashMap::new();
+    for s in &visible { *totals.entry(s.project_full.clone()).or_insert(0) += 1; }
+    let mut seen: HashMap<String, u32> = HashMap::new();
+    for s in &mut visible {
+        let total = totals.get(&s.project_full).copied().unwrap_or(1);
+        s.count = if total > 1 {
+            let n = seen.entry(s.project_full.clone()).and_modify(|v| *v += 1).or_insert(1);
+            *n
+        } else { 0 };
+    }
+
+    let rows: Vec<Row> = visible.iter().map(|s| {
         let main = if s.waiting {
             Style::default().fg(waiting_color).add_modifier(Modifier::BOLD)
         } else if s.active {
@@ -470,6 +495,7 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
     let Some(json) = run_tu(&["session", "-j", "--since", &today]) else { return; };
 
     struct ProjEntry {
+        session_id: String,
         active_first_dt: Option<chrono::NaiveDateTime>,
         active_last_dt: Option<chrono::NaiveDateTime>,
         last_dt: chrono::NaiveDateTime,
@@ -508,6 +534,7 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
             sources.insert(src);
 
             entries.push((project, ProjEntry {
+                session_id: session_id.to_string(),
                 active_first_dt: active_first,
                 active_last_dt:  active_last,
                 last_dt: effective_last,
@@ -518,18 +545,16 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
     }
 
     entries.sort_by(|a, b| b.1.last_dt.cmp(&a.1.last_dt));
-    let sorted: Vec<(String, ProjEntry)> = entries.into_iter().take(MAX_SESSIONS).collect();
-
-    let mut project_total: HashMap<String, u32> = HashMap::new();
-    for (proj, _) in &sorted {
-        *project_total.entry(proj.clone()).or_insert(0) += 1;
-    }
-    let mut project_seen: HashMap<String, u32> = HashMap::new();
+    // Keep extra rows (subagents may be hidden, then revealed by toggle).
+    let sorted: Vec<(String, ProjEntry)> = entries.into_iter()
+        .take(MAX_SESSIONS * 4)
+        .collect();
 
     let all: Vec<Session> = sorted.into_iter().map(|(project, e)| {
         let last_secs = (now - e.last_dt).num_seconds().max(0);
         let active = last_secs <= ACTIVE_MINS * 60;
         let waiting = active && last_secs >= 60;
+        let is_subagent = e.session_id.contains("/subagents/");
         let source = match (e.sources.contains("claude"), e.sources.contains("codex")) {
             (true, true) => "BOTH",
             (true, false) => "CLAUDE",
@@ -540,23 +565,20 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
             (Some(start), Some(end)) => fmt_duration((end - start).num_seconds().max(0)),
             _ => "--".into(),
         };
-        // (N) suffix only if multiple rows share this project
-        let total = project_total.get(&project).copied().unwrap_or(1);
-        let suffix_n = if total > 1 {
-            let n = project_seen.entry(project.clone()).and_modify(|v| *v += 1).or_insert(1);
-            *n
-        } else { 0 };
+        // (N) suffix is computed at render time after the subagent/active filter.
         Session {
             source,
             project: trunc(&project, 22),
+            project_full: project.clone(),
             model: e.model,
             run,
             last: fmt_ago(&e.last_dt, &now),
             tokens: fmt_tokens(e.tokens),
             cost: e.cost,
             active,
-            count: suffix_n,    // 0 = no suffix; 1+ = (N) duplicate label
+            count: 0,
             waiting,
+            is_subagent,
         }
     }).collect();
 

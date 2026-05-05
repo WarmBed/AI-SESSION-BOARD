@@ -55,6 +55,7 @@ mod win {
     const MENU_SCALE_200:    usize = 2024;
     const MENU_TOGGLE_ALL:   usize = 2030;
     const MENU_TOGGLE_CHARTS:usize = 2031;
+    const MENU_TOGGLE_SUBAG: usize = 2032;
     const MENU_BRIGHT_80:    usize = 2040;
     const MENU_BRIGHT_100:   usize = 2041;
     const MENU_BRIGHT_130:   usize = 2042;
@@ -99,16 +100,16 @@ mod win {
     struct Session {
         source:  String,
         project: String,
+        project_full: String,  // untruncated, used for duplicate counting after filter
         model:   String,
-        run:     String,   // how long it ran / has been running
-        last:    String,   // how long ago last activity
+        run:     String,
+        last:    String,
         tokens:  String,
         cost:    f64,
         active:  bool,
-        count:   u32,
-        /// Active session whose last activity is between 60s and ACTIVE_MINS:
-        /// agent has stopped streaming and is waiting for the user to reply.
+        count:   u32,           // (N) suffix; 0 = no suffix. Set by apply_filter().
         waiting: bool,
+        is_subagent: bool,      // detected from session_id containing "/subagents/"
     }
 
     // ─── App ──────────────────────────────────────────────────────────────────
@@ -136,6 +137,7 @@ mod win {
         brightness: f32,
         font:   HFONT,
         font_b: HFONT,
+        show_subagents: bool,   // when false, sessions with "/subagents/" in id are hidden
         // CPU/RAM charts
         show_charts: bool,
         cpu_history: Vec<Vec<f64>>,
@@ -166,6 +168,7 @@ mod win {
                 font:   null_mut(),
                 font_b: null_mut(),
                 show_charts: true,
+                show_subagents: false,
                 cpu_history: vec![vec![0.0; HISTORY_LEN]; n],
                 ram_history: vec![vec![0.0; HISTORY_LEN]; n],
                 proc_counts: vec![0; n],
@@ -328,12 +331,41 @@ mod win {
             self.resize_window();
         }
 
+        fn toggle_subagents(&mut self) {
+            self.show_subagents = !self.show_subagents;
+            self.apply_filter();
+            self.resize_window();
+        }
+
         fn apply_filter(&mut self) {
-            self.sessions = if self.show_all {
-                self.all_sessions.clone()
-            } else {
-                self.all_sessions.iter().filter(|s| s.active).cloned().collect()
-            };
+            // 1. active / 24H filter
+            // 2. subagent filter
+            // 3. cap at MAX_SESSIONS rows
+            // 4. compute (N) suffix labels on the visible set
+            let mut filtered: Vec<Session> = self.all_sessions.iter()
+                .filter(|s| self.show_all || s.active)
+                .filter(|s| self.show_subagents || !s.is_subagent)
+                .take(MAX_SESSIONS)
+                .cloned()
+                .collect();
+
+            // Recompute duplicate counts on the filtered list.
+            let mut project_total: HashMap<String, u32> = HashMap::new();
+            for s in &filtered {
+                *project_total.entry(s.project_full.clone()).or_insert(0) += 1;
+            }
+            let mut project_seen: HashMap<String, u32> = HashMap::new();
+            for s in &mut filtered {
+                let total = project_total.get(&s.project_full).copied().unwrap_or(1);
+                if total > 1 {
+                    let n = project_seen.entry(s.project_full.clone())
+                        .and_modify(|v| *v += 1).or_insert(1);
+                    s.count = *n;
+                } else {
+                    s.count = 0;
+                }
+            }
+            self.sessions = filtered;
         }
 
         fn refresh_quota(&mut self) {
@@ -431,6 +463,7 @@ mod win {
             let now = chrono::Local::now().naive_local();
 
             struct ProjEntry {
+                session_id:      String,
                 active_first_dt: Option<chrono::NaiveDateTime>,
                 active_last_dt:  Option<chrono::NaiveDateTime>,
                 last_dt:         chrono::NaiveDateTime,
@@ -475,6 +508,7 @@ mod win {
                     sources.insert(src);
 
                     entries.push((project, ProjEntry {
+                        session_id: session_id.to_string(),
                         active_first_dt: active_first,
                         active_last_dt:  active_last,
                         last_dt: effective_last,
@@ -485,16 +519,15 @@ mod win {
             }
 
             entries.sort_by(|a, b| b.1.last_dt.cmp(&a.1.last_dt));
-            let sorted: Vec<(String, ProjEntry)> = entries.into_iter().take(MAX_SESSIONS).collect();
+            let sorted: Vec<(String, ProjEntry, bool)> = entries.into_iter()
+                .take(MAX_SESSIONS * 4) // keep extras so subagent toggle has fuel
+                .map(|(p, e)| {
+                    let is_sub = e.session_id.contains("/subagents/");
+                    (p, e, is_sub)
+                })
+                .collect();
 
-            // Build per-project counts so we know which projects need (N) suffixes.
-            let mut project_total: HashMap<String, u32> = HashMap::new();
-            for (proj, _) in &sorted {
-                *project_total.entry(proj.clone()).or_insert(0) += 1;
-            }
-            let mut project_seen: HashMap<String, u32> = HashMap::new();
-
-            self.all_sessions = sorted.into_iter().map(|(project, e)| {
+            self.all_sessions = sorted.into_iter().map(|(project, e, is_subagent)| {
                 let last_secs = (now - e.last_dt).num_seconds().max(0);
                 let active = last_secs <= ACTIVE_MINS * 60;
                 // "Waiting" = active but not currently streaming. Threshold: a Claude
@@ -512,26 +545,21 @@ mod win {
                     (Some(start), Some(end)) => fmt_duration((end - start).num_seconds().max(0)),
                     _ => "--".into(),
                 };
-                // Add (N) suffix only when there are duplicates of this project.
-                // First occurrence of a duplicated project becomes (1), the next (2), etc.
-                let total = project_total.get(&project).copied().unwrap_or(1);
-                let suffix_n = if total > 1 {
-                    let n = project_seen.entry(project.clone()).and_modify(|v| *v += 1).or_insert(1);
-                    Some(*n)
-                } else {
-                    None
-                };
+                // (N) suffix is computed in apply_filter() after subagent/active
+                // filtering, so the numbering reflects only the visible rows.
                 Session {
                     source,
                     project: trunc(&project, 18),
+                    project_full: project.clone(),
                     model:   e.model,
                     run,
                     last:    fmt_ago(&e.last_dt, &now),
                     tokens:  fmt_tokens(e.tokens),
                     cost:    e.cost,
                     active,
-                    count:   suffix_n.unwrap_or(0),  // 0 = no suffix; 1+ = (N)
+                    count:   0,
                     waiting,
+                    is_subagent,
                 }
             }).collect();
 
@@ -959,9 +987,9 @@ mod win {
         let menu = CreatePopupMenu();
         if menu.is_null() { return; }
 
-        let (opacity, scale, show_all, show_charts, brightness) = app_ref(hwnd)
-            .map(|a| (a.opacity, a.scale, a.show_all, a.show_charts, a.brightness))
-            .unwrap_or((255, 1.0, false, true, 1.0));
+        let (opacity, scale, show_all, show_charts, brightness, show_subagents) = app_ref(hwnd)
+            .map(|a| (a.opacity, a.scale, a.show_all, a.show_charts, a.brightness, a.show_subagents))
+            .unwrap_or((255, 1.0, false, true, 1.0, false));
 
         // Toggle 24h / active-only
         let toggle_label = if show_all { "表示: 24H \u{2714}" } else { "表示: Active Only" };
@@ -970,6 +998,10 @@ mod win {
         // Toggle CPU/RAM charts
         let chart_label = if show_charts { "Charts: ON \u{2714}" } else { "Charts: OFF" };
         AppendMenuW(menu, MF_STRING, MENU_TOGGLE_CHARTS, wide(chart_label).as_ptr());
+
+        // Toggle subagent visibility
+        let sub_label = if show_subagents { "Subagents: ON \u{2714}" } else { "Subagents: OFF" };
+        AppendMenuW(menu, MF_STRING, MENU_TOGGLE_SUBAG, wide(sub_label).as_ptr());
 
         // Opacity submenu
         let opacity_menu = CreatePopupMenu();
@@ -1062,6 +1094,7 @@ mod win {
                     MENU_CLOSE        => { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd); }
                     MENU_TOGGLE_ALL   => { if let Some(a) = app_mut(hwnd) { a.toggle_show_all(); } }
                     MENU_TOGGLE_CHARTS => { if let Some(a) = app_mut(hwnd) { a.toggle_charts(); } }
+                    MENU_TOGGLE_SUBAG  => { if let Some(a) = app_mut(hwnd) { a.toggle_subagents(); } }
                     MENU_OPACITY_40   => { if let Some(a) = app_mut(hwnd) { a.set_opacity(102); } }
                     MENU_OPACITY_70   => { if let Some(a) = app_mut(hwnd) { a.set_opacity(178); } }
                     MENU_OPACITY_100  => { if let Some(a) = app_mut(hwnd) { a.set_opacity(255); } }
