@@ -284,30 +284,17 @@ mod win {
             // 3. cap at MAX_SESSIONS rows
             // 4. compute (N) suffix labels on the visible set
             //
-            // Real-time state from the filesystem watcher: if a JSONL was
-            // written within the last few seconds, that session is currently
-            // streaming ("cooking"). Between 5–900s it's waiting for user.
+            // STEP 1: overlay watcher data on the *full* session list FIRST,
+            // so that sessions which build_snapshot last saw 10s ago (and
+            // would now look stale) get re-promoted to cooking the moment
+            // the OS reports a JSONL write. Filtering must happen AFTER this
+            // — otherwise sessions get filtered out before the watcher can
+            // rescue them.
             let watch_snap: HashMap<String, std::time::Instant> = self.watch_map.lock()
                 .ok().map(|m| m.clone()).unwrap_or_default();
             let now_inst = std::time::Instant::now();
-
-            let mut filtered: Vec<Session> = self.all_sessions.iter()
-                .filter(|s| self.show_all || s.active || s.waiting)
-                .filter(|s| self.show_subagents || !s.is_subagent)
-                .take(MAX_SESSIONS)
-                .cloned()
-                .collect();
-
-            // Overlay watcher data into active/waiting flags. Thresholds match
-            // what fmt_ago displays as LAST so the row color stays consistent
-            // with what the user reads:
-            //   LAST=今  (< 60s ago)        → cooking (white, green dot)
-            //   LAST=1m..14m                → waiting (yellow). Pulses for the
-            //                                 first 30s of waiting only — long
-            //                                 enough to notice, short enough
-            //                                 not to flicker indefinitely.
-            //   LAST=15m+                   → idle (dim)
-            for s in &mut filtered {
+            let mut all = self.all_sessions.clone();
+            for s in &mut all {
                 if let Some(last_write) = watch_snap.get(&s.session_id) {
                     let secs = now_inst.duration_since(*last_write).as_secs();
                     if secs < 60 {
@@ -317,7 +304,7 @@ mod win {
                     } else if secs < (ACTIVE_MINS as u64) * 60 {
                         s.active = true;
                         s.waiting = true;
-                        s.flashing = secs < 90; // flash window: 60s..90s
+                        s.flashing = secs < 90;
                     } else {
                         s.active = false;
                         s.waiting = false;
@@ -325,6 +312,13 @@ mod win {
                     }
                 }
             }
+
+            // STEP 2: NOW filter using freshly-overlaid flags.
+            let mut filtered: Vec<Session> = all.into_iter()
+                .filter(|s| self.show_all || s.active)
+                .filter(|s| self.show_subagents || !s.is_subagent)
+                .take(MAX_SESSIONS)
+                .collect();
 
             // Recompute duplicate counts on the filtered list.
             let mut project_total: HashMap<String, u32> = HashMap::new();

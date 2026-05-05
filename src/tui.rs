@@ -237,9 +237,11 @@ fn render_table(f: &mut Frame, area: Rect, st: &State) {
         if s.flashing && flash_dim_phase { dim_yellow } else { solid_yellow }
     };
 
-    // Filter subagents according to toggle, then take MAX_SESSIONS rows, then
-    // recompute (N) duplicate suffixes on the visible set.
+    // Filter at render time so the watcher overlay (which mutates active /
+    // waiting / flashing flags every tick) has already had a chance to
+    // rescue sessions that the last fetch saw as stale.
     let mut visible: Vec<Session> = st.sessions.iter()
+        .filter(|s| st.show_all || s.active)
         .filter(|s| st.show_subagents || !s.is_subagent)
         .take(MAX_SESSIONS)
         .cloned()
@@ -467,11 +469,12 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
         }
     }).collect();
 
-    st.sessions = if show_all {
-        all
-    } else {
-        all.into_iter().filter(|s| s.active).collect()
-    };
+    // Send ALL sessions through the snapshot — render-time filter (after the
+    // watcher overlay) decides which ones to show. Otherwise stale active
+    // flags from this fetch could exclude sessions before the watcher can
+    // rescue them.
+    let _ = show_all;
+    st.sessions = all;
 
     refresh_quota(st);
 }
