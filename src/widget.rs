@@ -415,30 +415,25 @@ mod win {
 
     } // end impl BoardApp — free helpers below
 
-    /// Build a fresh `Snapshot` (sessions + footer + MTD). Runs entirely in the
-    /// background worker thread so the UI never stalls on `tu` subprocesses or
-    /// JSONL parses.
-    fn build_snapshot() -> Option<Snapshot> {
-        let today_str   = chrono::Local::now().format("%Y%m%d").to_string();
+    /// Run `tu session --since YYYYMM01` and sum cost across the month.
+    /// Slow (reads many JSONLs); call infrequently.
+    fn fetch_mtd_cost() -> f64 {
         let month_start = chrono::Local::now().format("%Y%m01").to_string();
-
-        // MTD cost (sum across this month's tu sessions).
-        let mut mtd_cost = 0.0;
-        if let Ok(mo) = std::process::Command::new("cmd")
+        let Ok(mo) = std::process::Command::new("cmd")
             .args(["/c", "tu", "session", "-j", "--since", &month_start])
             .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            let raw_mo = if !mo.stdout.is_empty() { mo.stdout } else { mo.stderr };
-            if let Ok(jm) = serde_json::from_slice::<serde_json::Value>(&raw_mo) {
-                if let Some(arr) = jm["sessions"].as_array() {
-                    mtd_cost = arr.iter()
-                        .map(|s| s["totals"]["cost_usd"].as_f64().unwrap_or(0.0))
-                        .sum();
-                }
-            }
-        }
+            .output() else { return 0.0 };
+        let raw = if !mo.stdout.is_empty() { mo.stdout } else { mo.stderr };
+        let Ok(jm) = serde_json::from_slice::<serde_json::Value>(&raw) else { return 0.0 };
+        let Some(arr) = jm["sessions"].as_array() else { return 0.0 };
+        arr.iter().map(|s| s["totals"]["cost_usd"].as_f64().unwrap_or(0.0)).sum()
+    }
 
+    /// Build the today-only snapshot (sessions + quota footer). MTD cost is
+    /// passed in by the caller because it changes slowly and is recomputed
+    /// less frequently than the rest.
+    fn build_snapshot(mtd_cost: f64) -> Option<Snapshot> {
+        let today_str = chrono::Local::now().format("%Y%m%d").to_string();
         let out = std::process::Command::new("cmd")
             .args(["/c", "tu", "session", "-j", "--since", &today_str])
             .creation_flags(CREATE_NO_WINDOW)
@@ -605,15 +600,24 @@ mod win {
         let (tx, rx) = std::sync::mpsc::channel::<Snapshot>();
         let stop_w = stop.clone();
         std::thread::spawn(move || {
-            // Initial fetch immediately so the UI shows data within ~1 cycle.
-            if let Some(snap) = build_snapshot() {
+            // MTD cost is expensive (scans the whole month's JSONLs) but
+            // changes slowly — recompute every 60s instead of every 5s.
+            let mut mtd_cost = fetch_mtd_cost();
+            let mut last_mtd_at = Instant::now();
+
+            if let Some(snap) = build_snapshot(mtd_cost) {
                 if tx.send(snap).is_err() { return; }
             }
             loop {
                 if stop_w.load(Ordering::Relaxed) { break; }
                 std::thread::sleep(Duration::from_secs(REFRESH_SECS));
                 if stop_w.load(Ordering::Relaxed) { break; }
-                if let Some(snap) = build_snapshot() {
+
+                if last_mtd_at.elapsed() >= Duration::from_secs(60) {
+                    mtd_cost = fetch_mtd_cost();
+                    last_mtd_at = Instant::now();
+                }
+                if let Some(snap) = build_snapshot(mtd_cost) {
                     if tx.send(snap).is_err() { break; }
                 }
             }
@@ -918,23 +922,24 @@ mod win {
     ) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         let stop_w = stop.clone();
         std::thread::spawn(move || {
-            // System::new() doesn't refresh memory, so total_memory() returns 0
-            // and every RAM percentage divides by zero. new_all() fully primes
-            // the system info on first construction.
+            // new_all() primes total_memory(); without it RAM% divides by zero.
             let mut sys = sysinfo::System::new_all();
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            // Per-tick refresh: only CPU + memory. Skipping disk/exe/env/cwd
+            // saves >70% of the sampler's CPU cost on Windows.
+            let kind = ProcessRefreshKind::new().with_cpu().with_memory();
+            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
             let total_ram_mb = sys.total_memory() as f64 / 1024.0 / 1024.0;
-            // sysinfo's cpu_usage() returns % of one core; divide by core count
-            // so a fully-pegged 16-thread process is shown as 100% (system CPU).
             let core_count = sys.cpus().len().max(1) as f64;
             loop {
                 if stop_w.load(Ordering::Relaxed) { break; }
-                std::thread::sleep(Duration::from_millis(1000));
-                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                // 2s instead of 1s — chart still smooth, halves the CPU.
+                std::thread::sleep(Duration::from_millis(2000));
+                sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
                 let n = CHART_TARGETS.len();
                 let mut cpu = vec![0.0f64; n];
                 let mut ram = vec![0.0f64; n];

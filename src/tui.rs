@@ -40,7 +40,7 @@ const ACTIVE_MINS: i64 = 15;
 const MAX_SESSIONS: usize = 12;
 const REFRESH_SECS: u64 = 5;
 const HISTORY_LEN: usize = 60;
-const SAMPLE_INTERVAL_MS: u64 = 1000;
+const SAMPLE_INTERVAL_MS: u64 = 2000;
 const TARGETS: &[(&str, Color)] = &[("claude", Color::Cyan), ("codex", Color::Yellow)];
 
 #[derive(Clone)]
@@ -119,18 +119,19 @@ pub fn run() -> io::Result<()> {
     {
         let stop = stop_flag.clone();
         thread::spawn(move || {
-            // new_all() primes total_memory() and all process info — without this,
-            // total_memory() is 0 and every RAM% divides by zero.
+            use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+            // new_all() primes total_memory(); without it RAM% divides by zero.
             let mut sys = System::new_all();
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            // Per-tick refresh: only CPU + memory. Skipping disk/exe/env/cwd
+            // saves >70% of the sampler's CPU cost on Windows.
+            let kind = ProcessRefreshKind::new().with_cpu().with_memory();
+            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
             let total_ram_mb = sys.total_memory() as f64 / 1024.0 / 1024.0;
-            // sysinfo's cpu_usage() is % of one core — divide by core count so
-            // 100% means the whole system is pegged.
             let core_count = sys.cpus().len().max(1) as f64;
             loop {
                 if stop.load(Ordering::Relaxed) { break; }
                 thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
-                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
                 let mut s = ProcSample {
                     cpu: vec![0.0; TARGETS.len()],
                     ram: vec![0.0; TARGETS.len()],
@@ -165,18 +166,24 @@ pub fn run() -> io::Result<()> {
         thread::spawn(move || {
             // Initial fetch with default mode.
             let mut current_show_all = false;
-            let _ = snap_tx.send(fetch_snapshot(current_show_all));
+            // MTD recomputed every 60s — it changes much slower than session state.
+            let mut mtd_cost = fetch_mtd_cost();
+            let mut last_mtd_at = Instant::now();
+            let _ = snap_tx.send(fetch_snapshot(current_show_all, mtd_cost));
 
             loop {
                 if stop.load(Ordering::Relaxed) { break; }
-                // Wait up to REFRESH_SECS for a manual request, otherwise tick.
                 match req_rx.recv_timeout(Duration::from_secs(REFRESH_SECS)) {
                     Ok(req) => current_show_all = req.show_all,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {} // periodic refresh
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
                 if stop.load(Ordering::Relaxed) { break; }
-                if snap_tx.send(fetch_snapshot(current_show_all)).is_err() { break; }
+                if last_mtd_at.elapsed() >= Duration::from_secs(60) {
+                    mtd_cost = fetch_mtd_cost();
+                    last_mtd_at = Instant::now();
+                }
+                if snap_tx.send(fetch_snapshot(current_show_all, mtd_cost)).is_err() { break; }
             }
         });
     }
@@ -467,29 +474,33 @@ fn render_footer(f: &mut Frame, area: Rect, st: &State) {
 // ─── Data refresh (duplicates board_widget.rs logic) ──────────────────────
 
 /// Synchronous, blocking — runs in the background worker thread.
-fn fetch_snapshot(show_all: bool) -> Snapshot {
+fn fetch_snapshot(show_all: bool, mtd_cost: f64) -> Snapshot {
     let mut snap = Snapshot {
         sessions: Vec::new(),
         footer_segs: Vec::new(),
-        mtd_cost: 0.0,
+        mtd_cost,
     };
     do_fetch(&mut snap, show_all);
     snap
 }
 
-fn do_fetch(st: &mut Snapshot, show_all: bool) {
-    let now = chrono::Local::now().naive_local();
-    let today = chrono::Local::now().format("%Y%m%d").to_string();
+/// Run `tu session --since YYYYMM01` and sum cost. Slow — scans the whole
+/// month's JSONLs — so the worker calls this every 60s, not every 5s.
+fn fetch_mtd_cost() -> f64 {
     let month_start = chrono::Local::now().format("%Y%m01").to_string();
-
-    // MTD cost
     if let Some(json) = run_tu(&["session", "-j", "--since", &month_start]) {
         if let Some(arr) = json["sessions"].as_array() {
-            st.mtd_cost = arr.iter()
+            return arr.iter()
                 .map(|s| s["totals"]["cost_usd"].as_f64().unwrap_or(0.0))
                 .sum();
         }
     }
+    0.0
+}
+
+fn do_fetch(st: &mut Snapshot, show_all: bool) {
+    let now = chrono::Local::now().naive_local();
+    let today = chrono::Local::now().format("%Y%m%d").to_string();
 
     // Today's sessions
     let Some(json) = run_tu(&["session", "-j", "--since", &today]) else { return; };
