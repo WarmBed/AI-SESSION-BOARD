@@ -80,7 +80,7 @@ mod win {
 
     const TIMER_ID:     usize = 1;
     const TIMER_MS:     u32   = 1000;
-    const REFRESH_SECS: u64   = 5;
+    const REFRESH_SECS: u64   = 10;
     const ACTIVE_MINS:  i64   = 15;
     const MAX_SESSIONS: usize = 10;
 
@@ -415,18 +415,37 @@ mod win {
 
     } // end impl BoardApp — free helpers below
 
-    /// Run `tu session --since YYYYMM01` and sum cost across the month.
-    /// Slow (reads many JSONLs); call infrequently.
-    fn fetch_mtd_cost() -> f64 {
-        let month_start = chrono::Local::now().format("%Y%m01").to_string();
+    /// Sum the cost of every day from month-start up to (but not including)
+    /// today. Past days are frozen — once cached, this never needs to be
+    /// recomputed until the day rolls over at midnight.
+    ///
+    /// Uses `tu daily -j` instead of `tu session -j` because tu pre-aggregates
+    /// per-day totals there, avoiding a per-session scan.
+    fn fetch_past_days_cost() -> f64 {
+        let now = chrono::Local::now();
+        let month_start = now.format("%Y%m01").to_string();
+        let today_str = now.format("%Y-%m-%d").to_string();
+
         let Ok(mo) = std::process::Command::new("cmd")
-            .args(["/c", "tu", "session", "-j", "--since", &month_start])
+            .args(["/c", "tu", "daily", "-j", "--since", &month_start])
             .creation_flags(CREATE_NO_WINDOW)
             .output() else { return 0.0 };
         let raw = if !mo.stdout.is_empty() { mo.stdout } else { mo.stderr };
         let Ok(jm) = serde_json::from_slice::<serde_json::Value>(&raw) else { return 0.0 };
-        let Some(arr) = jm["sessions"].as_array() else { return 0.0 };
-        arr.iter().map(|s| s["totals"]["cost_usd"].as_f64().unwrap_or(0.0)).sum()
+        let Some(arr) = jm["daily"].as_array() else { return 0.0 };
+        arr.iter()
+            .filter(|d| d["date"].as_str().map(|s| s < today_str.as_str()).unwrap_or(false))
+            .map(|d| d["totals"]["cost_usd"].as_f64().unwrap_or(0.0))
+            .sum()
+    }
+
+    /// Read today's cost from tu's live-frame-cache.json — tiny file,
+    /// already maintained by `tu live`, no subprocess needed.
+    fn read_today_cost() -> f64 {
+        let path = r"C:\Users\mike2\AppData\Local\tokenusage\live-frame-cache.json";
+        let Ok(raw) = std::fs::read(path) else { return 0.0 };
+        let Ok(j) = serde_json::from_slice::<serde_json::Value>(&raw) else { return 0.0 };
+        j["today_totals"]["cost_usd"].as_f64().unwrap_or(0.0)
     }
 
     /// Build the today-only snapshot (sessions + quota footer). MTD cost is
@@ -600,12 +619,16 @@ mod win {
         let (tx, rx) = std::sync::mpsc::channel::<Snapshot>();
         let stop_w = stop.clone();
         std::thread::spawn(move || {
-            // MTD cost is expensive (scans the whole month's JSONLs) but
-            // changes slowly — recompute every 60s instead of every 5s.
-            let mut mtd_cost = fetch_mtd_cost();
-            let mut last_mtd_at = Instant::now();
+            // Past-days MTD is *frozen* (Jan 1 → yesterday will never change).
+            // Compute once on startup, then only when the day rolls over.
+            let mut past_days_cost = fetch_past_days_cost();
+            let mut cached_for_day = chrono::Local::now().date_naive();
 
-            if let Some(snap) = build_snapshot(mtd_cost) {
+            // Today's cost comes from tu's tiny live-frame-cache.json — no
+            // subprocess needed at all on subsequent refreshes.
+            let mtd = past_days_cost + read_today_cost();
+
+            if let Some(snap) = build_snapshot(mtd) {
                 if tx.send(snap).is_err() { return; }
             }
             loop {
@@ -613,11 +636,13 @@ mod win {
                 std::thread::sleep(Duration::from_secs(REFRESH_SECS));
                 if stop_w.load(Ordering::Relaxed) { break; }
 
-                if last_mtd_at.elapsed() >= Duration::from_secs(60) {
-                    mtd_cost = fetch_mtd_cost();
-                    last_mtd_at = Instant::now();
+                let today = chrono::Local::now().date_naive();
+                if today != cached_for_day {
+                    past_days_cost = fetch_past_days_cost();
+                    cached_for_day = today;
                 }
-                if let Some(snap) = build_snapshot(mtd_cost) {
+                let mtd = past_days_cost + read_today_cost();
+                if let Some(snap) = build_snapshot(mtd) {
                     if tx.send(snap).is_err() { break; }
                 }
             }

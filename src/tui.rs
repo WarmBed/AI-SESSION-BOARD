@@ -38,7 +38,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const ACTIVE_MINS: i64 = 15;
 const MAX_SESSIONS: usize = 12;
-const REFRESH_SECS: u64 = 5;
+const REFRESH_SECS: u64 = 10;
 const HISTORY_LEN: usize = 60;
 const SAMPLE_INTERVAL_MS: u64 = 2000;
 const TARGETS: &[(&str, Color)] = &[("claude", Color::Cyan), ("codex", Color::Yellow)];
@@ -164,11 +164,11 @@ pub fn run() -> io::Result<()> {
     {
         let stop = stop_flag.clone();
         thread::spawn(move || {
-            // Initial fetch with default mode.
             let mut current_show_all = false;
-            // MTD recomputed every 60s — it changes much slower than session state.
-            let mut mtd_cost = fetch_mtd_cost();
-            let mut last_mtd_at = Instant::now();
+            // Past-days MTD is frozen until midnight — compute once.
+            let mut past_days_cost = fetch_past_days_cost();
+            let mut cached_for_day = chrono::Local::now().date_naive();
+            let mtd_cost = past_days_cost + read_today_cost();
             let _ = snap_tx.send(fetch_snapshot(current_show_all, mtd_cost));
 
             loop {
@@ -179,10 +179,12 @@ pub fn run() -> io::Result<()> {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
                 if stop.load(Ordering::Relaxed) { break; }
-                if last_mtd_at.elapsed() >= Duration::from_secs(60) {
-                    mtd_cost = fetch_mtd_cost();
-                    last_mtd_at = Instant::now();
+                let today = chrono::Local::now().date_naive();
+                if today != cached_for_day {
+                    past_days_cost = fetch_past_days_cost();
+                    cached_for_day = today;
                 }
+                let mtd_cost = past_days_cost + read_today_cost();
                 if snap_tx.send(fetch_snapshot(current_show_all, mtd_cost)).is_err() { break; }
             }
         });
@@ -484,18 +486,33 @@ fn fetch_snapshot(show_all: bool, mtd_cost: f64) -> Snapshot {
     snap
 }
 
-/// Run `tu session --since YYYYMM01` and sum cost. Slow — scans the whole
-/// month's JSONLs — so the worker calls this every 60s, not every 5s.
-fn fetch_mtd_cost() -> f64 {
-    let month_start = chrono::Local::now().format("%Y%m01").to_string();
-    if let Some(json) = run_tu(&["session", "-j", "--since", &month_start]) {
-        if let Some(arr) = json["sessions"].as_array() {
+/// Sum the cost of every day from month-start up to (but not including) today.
+/// Past days are frozen — call this once on startup, then only at midnight.
+fn fetch_past_days_cost() -> f64 {
+    let now = chrono::Local::now();
+    let month_start = now.format("%Y%m01").to_string();
+    let today_str = now.format("%Y-%m-%d").to_string();
+    if let Some(json) = run_tu(&["daily", "-j", "--since", &month_start]) {
+        if let Some(arr) = json["daily"].as_array() {
             return arr.iter()
-                .map(|s| s["totals"]["cost_usd"].as_f64().unwrap_or(0.0))
+                .filter(|d| d["date"].as_str().map(|s| s < today_str.as_str()).unwrap_or(false))
+                .map(|d| d["totals"]["cost_usd"].as_f64().unwrap_or(0.0))
                 .sum();
         }
     }
     0.0
+}
+
+/// Read today's cost from tu's live-frame-cache.json — tiny file, already
+/// maintained by `tu live`, no subprocess needed.
+fn read_today_cost() -> f64 {
+    let path = format!(
+        "{}\\AppData\\Local\\tokenusage\\live-frame-cache.json",
+        std::env::var("USERPROFILE").unwrap_or_default()
+    );
+    let Ok(raw) = std::fs::read(&path) else { return 0.0 };
+    let Ok(j) = serde_json::from_slice::<serde_json::Value>(&raw) else { return 0.0 };
+    j["today_totals"]["cost_usd"].as_f64().unwrap_or(0.0)
 }
 
 fn do_fetch(st: &mut Snapshot, show_all: bool) {
