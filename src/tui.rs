@@ -675,9 +675,15 @@ fn detect_model(v: &serde_json::Value) -> String {
     key.chars().take(8).collect::<String>().to_uppercase()
 }
 
-/// Per-session JSONL lookup. session_id from tu maps directly to a JSONL path
-/// under `~/.claude/projects/`. Returns (run_start, run_end) where
-/// run_start = timestamp of last real user message, run_end = file mtime.
+/// Mtime-keyed cache so idle JSONL files aren't re-read every 5s.
+static JSONL_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<
+        std::path::PathBuf,
+        (std::time::SystemTime, chrono::NaiveDateTime, chrono::NaiveDateTime),
+    >>
+> = std::sync::OnceLock::new();
+
+/// Per-session JSONL lookup with mtime caching.
 fn jsonl_run_for_session(session_id: &str)
     -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)>
 {
@@ -687,6 +693,14 @@ fn jsonl_run_for_session(session_id: &str)
 
     let meta = std::fs::metadata(&path).ok()?;
     let mtime_sys = meta.modified().ok()?;
+
+    // Cache hit: file unchanged since last parse.
+    let cache = JSONL_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(c) = cache.lock() {
+        if let Some((cached_mtime, s, e)) = c.get(&path) {
+            if *cached_mtime == mtime_sys { return Some((*s, *e)); }
+        }
+    }
 
     let content = std::fs::read_to_string(&path).ok()?;
     let mut last_user_utc: Option<chrono::DateTime<chrono::Utc>> = None;
@@ -707,6 +721,10 @@ fn jsonl_run_for_session(session_id: &str)
     let start_local = start_utc.with_timezone(&chrono::Local).naive_local();
     let end_naive = end_local.naive_local();
     if end_naive < start_local { return None; }
+
+    if let Ok(mut c) = cache.lock() {
+        c.insert(path, (mtime_sys, start_local, end_naive));
+    }
     Some((start_local, end_naive))
 }
 

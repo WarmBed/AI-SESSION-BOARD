@@ -774,29 +774,39 @@ mod win {
         }
     }
 
+    /// Mtime-keyed cache of (run_start, run_end) per JSONL file. Refresh
+    /// reads ~/.claude/projects/ for *every* tu session; without this cache
+    /// idle sessions cause megabytes of disk IO every 5 seconds, which makes
+    /// the host (psmux) feel sluggish.
+    static JSONL_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<
+            std::path::PathBuf,
+            (std::time::SystemTime, chrono::NaiveDateTime, chrono::NaiveDateTime),
+        >>
+    > = std::sync::OnceLock::new();
+
     /// Look up a single tu session_id's JSONL file and return (run_start, run_end).
-    ///
-    /// `session_id` from `tu session -j` looks like:
-    ///   - "d--code-psmux/UUID"                           (main conversation)
-    ///   - "d--code-psmux/UUID/subagents/agent-XXXX"      (subagent)
-    ///
-    /// Both map directly to a JSONL path:
-    ///   ~/.claude/projects/<session_id>.jsonl
-    ///
-    /// run_start = timestamp of the last real user message in that file
-    /// run_end   = file mtime (Claude appends as it streams; mtime ≈ last token written)
+    /// Caches results by mtime so unchanged files are never re-parsed.
     fn jsonl_run_for_session(session_id: &str)
         -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)>
     {
         use chrono::TimeZone;
         let home = std::env::var("USERPROFILE").ok()?;
         let rel = session_id.replace('/', "\\");
-        let path = format!(r"{}\.claude\projects\{}.jsonl", home, rel);
-        let path = std::path::PathBuf::from(path);
+        let path = std::path::PathBuf::from(format!(r"{}\.claude\projects\{}.jsonl", home, rel));
 
         let meta = std::fs::metadata(&path).ok()?;
         let mtime_sys = meta.modified().ok()?;
 
+        // Cache hit: mtime hasn't changed since last parse.
+        let cache = JSONL_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Ok(c) = cache.lock() {
+            if let Some((cached_mtime, s, e)) = c.get(&path) {
+                if *cached_mtime == mtime_sys { return Some((*s, *e)); }
+            }
+        }
+
+        // Cache miss: read and parse.
         let content = std::fs::read_to_string(&path).ok()?;
         let mut last_user_utc: Option<chrono::DateTime<chrono::Utc>> = None;
         for line in content.lines() {
@@ -817,6 +827,10 @@ mod win {
         let end_naive = end_local.naive_local();
 
         if end_naive < start_local { return None; }
+
+        if let Ok(mut c) = cache.lock() {
+            c.insert(path, (mtime_sys, start_local, end_naive));
+        }
         Some((start_local, end_naive))
     }
 
