@@ -1,0 +1,46 @@
+[package]
+name = "ai-session-board"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time dashboard for Claude Code and Codex CLI sessions — floating Win32 overlay or in-terminal TUI"
+license = "MIT"
+repository = "https://github.com/warmbed/ai-session-board"
+readme = "README.md"
+keywords = ["claude", "codex", "dashboard", "monitor", "tui"]
+categories = ["command-line-utilities", "visualization"]
+
+[[bin]]
+name = "ai-board"
+path = "src/main.rs"
+
+[lib]
+name = "ai_session_board"
+path = "src/lib.rs"
+
+[dependencies]
+chrono     = "0.4"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow     = "1"
+glob       = "0.3"
+ureq       = { version = "2", features = ["json"] }
+ratatui    = "0.30"
+crossterm  = "0.29"
+sysinfo    = { version = "0.32", default-features = false, features = ["system"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"
