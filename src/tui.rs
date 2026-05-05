@@ -24,12 +24,10 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Row, Table},
+    widgets::{Block, Borders, Paragraph, Row, Table},
     Frame, Terminal,
 };
-use sysinfo::System;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -39,22 +37,21 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const ACTIVE_MINS: i64 = 15;
 const MAX_SESSIONS: usize = 12;
 const REFRESH_SECS: u64 = 10;
-const HISTORY_LEN: usize = 60;
-const SAMPLE_INTERVAL_MS: u64 = 2000;
-const TARGETS: &[(&str, Color)] = &[("claude", Color::Cyan), ("codex", Color::Yellow)];
+const TU_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Clone)]
 struct Session {
     source: String,
     project: String,
-    project_full: String,   // untruncated, used for duplicate counting after filter
+    project_full: String,
+    session_id: String,     // matches watcher key & jsonl path
     model: String,
     run: String,
     last: String,
     tokens: String,
     cost: f64,
     active: bool,
-    count: u32,             // (N) suffix; 0 = none. Set in render after filtering.
+    count: u32,
     waiting: bool,
     is_subagent: bool,
 }
@@ -64,20 +61,9 @@ struct State {
     show_all: bool,
     footer_segs: Vec<(String, Color)>,
     mtd_cost: f64,
-    loading: bool,        // true while a background refresh is in flight
-    cpu_history: Vec<Vec<f64>>,   // one row per TARGETS entry
-    ram_history: Vec<Vec<f64>>,
-    proc_counts: Vec<usize>,
-    show_charts: bool,    // toggleable with `c`
+    loading: bool,
     show_subagents: bool, // toggleable with `s`
     tick: u64,            // increments each redraw — drives waiting-row flash
-}
-
-#[derive(Clone, Default)]
-struct ProcSample {
-    cpu: Vec<f64>,        // %; one entry per TARGETS
-    ram: Vec<f64>,        // % of total system RAM
-    counts: Vec<usize>,
 }
 
 /// Snapshot produced by the background refresh thread.
@@ -97,65 +83,22 @@ pub fn run() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend)?;
 
-    let n = TARGETS.len();
     let mut state = State {
         sessions: Vec::new(),
         show_all: false,
         footer_segs: Vec::new(),
         mtd_cost: 0.0,
         loading: true,
-        cpu_history: vec![vec![0.0; HISTORY_LEN]; n],
-        ram_history: vec![vec![0.0; HISTORY_LEN]; n],
-        proc_counts: vec![0; n],
-        show_charts: true,
         show_subagents: false,
         tick: 0,
     };
 
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    // CPU/RAM sampler: ticks every second, sends a ProcSample.
-    let (sample_tx, sample_rx) = mpsc::channel::<ProcSample>();
-    {
-        let stop = stop_flag.clone();
-        thread::spawn(move || {
-            use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
-            // new_all() primes total_memory(); without it RAM% divides by zero.
-            let mut sys = System::new_all();
-            // Per-tick refresh: only CPU + memory. Skipping disk/exe/env/cwd
-            // saves >70% of the sampler's CPU cost on Windows.
-            let kind = ProcessRefreshKind::new().with_cpu().with_memory();
-            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
-            let total_ram_mb = sys.total_memory() as f64 / 1024.0 / 1024.0;
-            let core_count = sys.cpus().len().max(1) as f64;
-            loop {
-                if stop.load(Ordering::Relaxed) { break; }
-                thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
-                sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
-                let mut s = ProcSample {
-                    cpu: vec![0.0; TARGETS.len()],
-                    ram: vec![0.0; TARGETS.len()],
-                    counts: vec![0; TARGETS.len()],
-                };
-                for proc in sys.processes().values() {
-                    let name = proc.name().to_string_lossy().to_lowercase();
-                    for (idx, (target, _)) in TARGETS.iter().enumerate() {
-                        if name.contains(target) {
-                            s.cpu[idx] += proc.cpu_usage() as f64 / core_count;
-                            // proc.memory() returns bytes (sysinfo 0.30+).
-                            let rss_mb = proc.memory() as f64 / 1024.0 / 1024.0;
-                            if total_ram_mb > 0.0 {
-                                s.ram[idx] += rss_mb / total_ram_mb * 100.0;
-                            }
-                            s.counts[idx] += 1;
-                            break;
-                        }
-                    }
-                }
-                if sample_tx.send(s).is_err() { break; }
-            }
-        });
-    }
+    // Filesystem watcher: instant per-session activity detection.
+    let watch_map: Arc<std::sync::Mutex<std::collections::HashMap<String, Instant>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let watch_stop = spawn_jsonl_watcher(watch_map.clone());
 
     // Background worker: fetches snapshots without blocking the UI loop.
     // Triggered immediately, then on every RefreshRequest received via tx.
@@ -189,10 +132,6 @@ pub fn run() -> io::Result<()> {
             }
         });
     }
-
-    let mut last_refresh = Instant::now();
-    let _ = last_refresh; // silence unused-mut if logic changes later
-
     let result = (|| -> io::Result<()> {
         loop {
             // Drain any snapshots produced by the worker (non-blocking).
@@ -203,18 +142,8 @@ pub fn run() -> io::Result<()> {
                 state.loading = false;
             }
 
-            // Drain process samples (1Hz), shifting each into the history ring.
-            while let Ok(s) = sample_rx.try_recv() {
-                for i in 0..TARGETS.len() {
-                    let cpu = state.cpu_history[i].clone();
-                    let ram = state.ram_history[i].clone();
-                    state.cpu_history[i] = cpu.into_iter().skip(1)
-                        .chain(std::iter::once(s.cpu[i])).collect();
-                    state.ram_history[i] = ram.into_iter().skip(1)
-                        .chain(std::iter::once(s.ram[i])).collect();
-                }
-                state.proc_counts = s.counts;
-            }
+            // Overlay watcher data into session active/waiting flags.
+            apply_watcher_state(&mut state, &watch_map);
 
             state.tick = state.tick.wrapping_add(1);
             term.draw(|f| render(f, &state))?;
@@ -238,10 +167,6 @@ pub fn run() -> io::Result<()> {
                                 KeyCode::Char('r') => {
                                     state.loading = true;
                                     let _ = req_tx.send(RefreshRequest { show_all: state.show_all });
-                                    break;
-                                }
-                                KeyCode::Char('c') => {
-                                    state.show_charts = !state.show_charts;
                                     break;
                                 }
                                 KeyCode::Char('s') => {
@@ -270,93 +195,18 @@ pub fn run() -> io::Result<()> {
 
 fn render(f: &mut Frame, st: &State) {
     let area = f.area();
-
-    // Allocate up to 10 rows for charts if the terminal is tall enough,
-    // and the user hasn't hidden them via `c`.
-    let chart_rows: u16 = if !st.show_charts { 0 }
-        else if area.height >= 24 { 10 }
-        else if area.height >= 16 { 7 }
-        else { 0 };
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                  // title bar
-            Constraint::Min(3),                     // table
-            Constraint::Length(chart_rows),         // CPU/RAM charts (or 0)
-            Constraint::Length(1),                  // footer
+            Constraint::Length(1), // title bar
+            Constraint::Min(3),    // table
+            Constraint::Length(1), // footer
         ])
         .split(area);
 
     render_title(f, chunks[0], st);
     render_table(f, chunks[1], st);
-    if chart_rows > 0 { render_charts(f, chunks[2], st); }
-    render_footer(f, chunks[3], st);
-}
-
-fn render_charts(f: &mut Frame, area: Rect, st: &State) {
-    let halves = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    // Shared Y scale across CPU and RAM (both are %-of-system) so the 0 baseline
-    // and visual scale match. Floor at 20 so small values remain readable.
-    let max_cpu = st.cpu_history.iter().flat_map(|h| h.iter().copied()).fold(0.0_f64, f64::max);
-    let max_ram = st.ram_history.iter().flat_map(|h| h.iter().copied()).fold(0.0_f64, f64::max);
-    let shared_max = max_cpu.max(max_ram).ceil().max(20.0);
-    render_chart(f, halves[0], st, true, shared_max);
-    render_chart(f, halves[1], st, false, shared_max);
-}
-
-fn render_chart(f: &mut Frame, area: Rect, st: &State, is_cpu: bool, max_y: f64) {
-    let history = if is_cpu { &st.cpu_history } else { &st.ram_history };
-
-    // Convert each target's history into (x, y) points; ratatui's Chart
-    // expects f64 pairs. Hold the buffers so the dataset references stay live.
-    let data_owned: Vec<Vec<(f64, f64)>> = history.iter().map(|h| {
-        h.iter().enumerate().map(|(x, &y)| (x as f64, y)).collect()
-    }).collect();
-
-    let mut datasets: Vec<Dataset> = Vec::new();
-    for (i, (label, color)) in TARGETS.iter().enumerate() {
-        datasets.push(
-            Dataset::default()
-                .name(*label)
-                .marker(symbols::Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(Style::default().fg(*color))
-                .data(&data_owned[i])
-        );
-    }
-
-    let title_text = if is_cpu { "CPU %" } else { "RAM %" };
-    // Build a Line with colored legend: "CPU %  ●claude(N)  ●codex(N)"
-    let mut title_spans: Vec<Span> = vec![
-        Span::styled(format!("{} ", title_text),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-    ];
-    for (i, (name, color)) in TARGETS.iter().enumerate() {
-        let v = history.get(i).and_then(|h| h.last().copied()).unwrap_or(0.0);
-        title_spans.push(Span::styled(
-            format!(" ●{} {:.1}%", name, v),
-            Style::default().fg(*color),
-        ));
-    }
-    let title = Line::from(title_spans);
-
-    let chart = Chart::new(datasets)
-        .block(Block::default().borders(Borders::ALL).title(title)
-            .border_style(Style::default().fg(Color::DarkGray)))
-        .x_axis(Axis::default().bounds([0.0, HISTORY_LEN as f64 - 1.0]))
-        .y_axis(Axis::default()
-            .bounds([0.0, max_y])
-            .labels(vec![
-                Span::raw("0"),
-                Span::raw(format!("{:.0}", max_y / 2.0)),
-                Span::raw(format!("{:.0}", max_y)),
-            ]));
-
-    f.render_widget(chart, area);
+    render_footer(f, chunks[2], st);
 }
 
 fn render_title(f: &mut Frame, area: Rect, st: &State) {
@@ -364,7 +214,7 @@ fn render_title(f: &mut Frame, area: Rect, st: &State) {
     let load = if st.loading { " ⏳" } else { "" };
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
     let left = format!("■ AI SESSION BOARD ■{}{}", mode, load);
-    let right = format!("{}    q quit · a 24H · c chart · s subagent · r refresh", now);
+    let right = format!("{}    q quit · a 24H · s subagent · r refresh", now);
     let pad = area.width.saturating_sub(left.len() as u16 + right.len() as u16) as usize;
     let line = Line::from(vec![
         Span::styled(left, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -598,6 +448,7 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
             source,
             project: trunc(&project, 22),
             project_full: project.clone(),
+            session_id: e.session_id.clone(),
             model: e.model,
             run,
             last: fmt_ago(&e.last_dt, &now),
@@ -654,9 +505,62 @@ fn run_tu(args: &[&str]) -> Option<serde_json::Value> {
     cmd.arg("/c").arg("tu").args(args);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
-    let out = cmd.output().ok()?;
+    let out = run_with_timeout(cmd, Duration::from_secs(TU_TIMEOUT_SECS))?;
     let raw = if !out.stdout.is_empty() { out.stdout } else { out.stderr };
     serde_json::from_slice(&raw).ok()
+}
+
+fn run_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    use std::fs::File;
+    use std::process::Stdio;
+
+    let stamp = chrono::Local::now().timestamp_nanos_opt().unwrap_or_default();
+    let base = std::env::temp_dir();
+    let stdout_path = base.join(format!("ai-board-tu-{}-{}.out", std::process::id(), stamp));
+    let stderr_path = base.join(format!("ai-board-tu-{}-{}.err", std::process::id(), stamp));
+    let stdout_file = File::create(&stdout_path).ok()?;
+    let stderr_file = File::create(&stderr_path).ok()?;
+
+    cmd.stdout(Stdio::from(stdout_file)).stderr(Stdio::from(stderr_file));
+    let mut child = cmd.spawn().ok()?;
+    let start = Instant::now();
+    loop {
+        if child.try_wait().ok()?.is_some() {
+            let status = child.wait().ok()?;
+            let stdout = std::fs::read(&stdout_path).unwrap_or_default();
+            let stderr = std::fs::read(&stderr_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&stdout_path);
+            let _ = std::fs::remove_file(&stderr_path);
+            return Some(std::process::Output { status, stdout, stderr });
+        }
+        if start.elapsed() >= timeout {
+            kill_process_tree(child.id());
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&stdout_path);
+            let _ = std::fs::remove_file(&stderr_path);
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(windows)]
+fn kill_process_tree(pid: u32) {
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/T", "/F", "/PID", &pid.to_string()]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let _ = cmd.output();
+}
+
+#[cfg(not(windows))]
+fn kill_process_tree(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .output();
 }
 
 fn source_of(v: &serde_json::Value) -> String {
@@ -796,3 +700,67 @@ fn trunc(s: &str, max: usize) -> String {
     if chars.len() <= max { s.to_string() }
     else { chars[..max - 1].iter().collect::<String>() + "…" }
 }
+
+// ─── Filesystem watcher (zero-polling activity detection) ────────────────
+
+fn spawn_jsonl_watcher(map: Arc<std::sync::Mutex<std::collections::HashMap<String, Instant>>>)
+    -> Arc<AtomicBool>
+{
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_w = stop.clone();
+    thread::spawn(move || {
+        use notify::{Watcher, RecursiveMode, EventKind};
+        let Ok(home) = std::env::var("USERPROFILE") else { return };
+        let projects_root = std::path::PathBuf::from(home.clone())
+            .join(".claude").join("projects");
+        let codex_root = std::path::PathBuf::from(home).join(".codex").join("sessions");
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res| { let _ = tx.send(res); }) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        let _ = watcher.watch(&projects_root, RecursiveMode::Recursive);
+        let _ = watcher.watch(&codex_root, RecursiveMode::Recursive);
+
+        for evt in rx {
+            if stop_w.load(Ordering::Relaxed) { break; }
+            let Ok(event) = evt else { continue };
+            if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) { continue; }
+            for path in &event.paths {
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+                let Some(sid) = session_id_from_path(path, &projects_root) else { continue };
+                if let Ok(mut m) = map.lock() {
+                    m.insert(sid, Instant::now());
+                }
+            }
+        }
+    });
+    stop
+}
+
+fn session_id_from_path(path: &std::path::Path, root: &std::path::Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?;
+    let s = rel.with_extension("").to_string_lossy().replace('\\', "/");
+    if s.is_empty() { None } else { Some(s) }
+}
+
+fn apply_watcher_state(state: &mut State,
+    map: &Arc<std::sync::Mutex<std::collections::HashMap<String, Instant>>>)
+{
+    let snap = map.lock().ok().map(|m| m.clone()).unwrap_or_default();
+    let now = Instant::now();
+    for s in &mut state.sessions {
+        if let Some(last) = snap.get(&s.session_id) {
+            let secs = now.duration_since(*last).as_secs();
+            if secs < 5 {
+                s.active = true; s.waiting = false;
+            } else if secs < (ACTIVE_MINS as u64) * 60 {
+                s.active = true; s.waiting = true;
+            } else {
+                s.active = false; s.waiting = false;
+            }
+        }
+    }
+}
+

@@ -54,7 +54,6 @@ mod win {
     const MENU_SCALE_150:    usize = 2023;
     const MENU_SCALE_200:    usize = 2024;
     const MENU_TOGGLE_ALL:   usize = 2030;
-    const MENU_TOGGLE_CHARTS:usize = 2031;
     const MENU_TOGGLE_SUBAG: usize = 2032;
     const MENU_BRIGHT_80:    usize = 2040;
     const MENU_BRIGHT_100:   usize = 2041;
@@ -81,6 +80,7 @@ mod win {
     const TIMER_ID:     usize = 1;
     const TIMER_MS:     u32   = 1000;
     const REFRESH_SECS: u64   = 10;
+    const TU_TIMEOUT_SECS: u64 = 8;
     const ACTIVE_MINS:  i64   = 15;
     const MAX_SESSIONS: usize = 10;
 
@@ -100,24 +100,23 @@ mod win {
     struct Session {
         source:  String,
         project: String,
-        project_full: String,  // untruncated, used for duplicate counting after filter
+        project_full: String,
+        session_id: String,     // tu's session id; matches watcher key & jsonl path
         model:   String,
         run:     String,
         last:    String,
         tokens:  String,
         cost:    f64,
         active:  bool,
-        count:   u32,           // (N) suffix; 0 = no suffix. Set by apply_filter().
+        count:   u32,
         waiting: bool,
-        is_subagent: bool,      // detected from session_id containing "/subagents/"
+        is_subagent: bool,
     }
 
-    // ─── App ──────────────────────────────────────────────────────────────────
-    const HISTORY_LEN: usize = 60;
-    const CHART_TARGETS: &[(&str, u32)] = &[
-        ("claude", 0x00CCAA00), // cyan-ish (BGR)
-        ("codex",  0x0000DDDD), // yellow-ish (BGR)
-    ];
+    /// Per-session timestamp of the last filesystem write, fed by the
+    /// notify-rs watcher. Lets us flip a session into "cooking" the
+    /// instant Claude appends a line, with no polling.
+    type WatchMap = std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>;
 
     /// Snapshot produced by the background data worker so the UI thread never
     /// blocks on `tu session` subprocess calls or JSONL parsing.
@@ -145,22 +144,28 @@ mod win {
         font:   HFONT,
         font_b: HFONT,
         show_subagents: bool,
-        show_charts: bool,
-        cpu_history: Vec<Vec<f64>>,
-        ram_history: Vec<Vec<f64>>,
-        proc_counts: Vec<usize>,
-        sample_rx: Option<std::sync::mpsc::Receiver<(Vec<f64>, Vec<f64>, Vec<usize>)>>,
-        sample_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-        // Background data worker — fetches snapshots without blocking the UI.
+        watch_map: std::sync::Arc<WatchMap>,
         snapshot_rx: Option<std::sync::mpsc::Receiver<Snapshot>>,
         data_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        watch_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    impl Drop for BoardApp {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            if let Some(stop) = &self.data_stop  { stop.store(true, Ordering::Relaxed); }
+            if let Some(stop) = &self.watch_stop { stop.store(true, Ordering::Relaxed); }
+        }
     }
 
     impl BoardApp {
         fn new(hwnd: HWND) -> Self {
             let (x, y) = initial_pos();
-            let n = CHART_TARGETS.len();
-            let (sample_rx, sample_stop) = spawn_proc_sampler();
+            // Filesystem watcher gives us millisecond-accurate "last write per
+            // session" without any polling — the OS notifies us.
+            let watch_map: std::sync::Arc<WatchMap> =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let watch_stop = spawn_jsonl_watcher(watch_map.clone());
             let (snapshot_rx, data_stop) = spawn_data_worker();
             let mut app = BoardApp {
                 hwnd, x, y,
@@ -176,15 +181,11 @@ mod win {
                 brightness: 1.0,
                 font:   null_mut(),
                 font_b: null_mut(),
-                show_charts: true,
                 show_subagents: false,
-                cpu_history: vec![vec![0.0; HISTORY_LEN]; n],
-                ram_history: vec![vec![0.0; HISTORY_LEN]; n],
-                proc_counts: vec![0; n],
-                sample_rx: Some(sample_rx),
-                sample_stop: Some(sample_stop),
+                watch_map,
                 snapshot_rx: Some(snapshot_rx),
                 data_stop: Some(data_stop),
+                watch_stop: Some(watch_stop),
             };
             app.rebuild_fonts();
             app
@@ -206,87 +207,6 @@ mod win {
             }
         }
 
-        unsafe fn draw_chart(&self, hdc: *mut std::ffi::c_void,
-                             x: i32, y: i32, w: i32, h: i32, is_cpu: bool, max_y: f64) {
-            // Title with colored legend: "CPU %  ●claude 5.0%  ●codex 0.3%"
-            let title = if is_cpu { "CPU %" } else { "RAM %" };
-            SetTextColor(hdc, self.bright(C_HDR));
-            txt(hdc, x + 4, y + 1, title);
-
-            // Draw colored dots + labels for legend
-            let title_w: i32 = {
-                let wt: Vec<u16> = title.encode_utf16().collect();
-                let mut sz = SIZE { cx: 0, cy: 0 };
-                GetTextExtentPoint32W(hdc, wt.as_ptr(), wt.len() as i32, &mut sz);
-                sz.cx
-            };
-            // Show the most recent value for each target instead of process counts.
-            let history_set = if is_cpu { &self.cpu_history } else { &self.ram_history };
-            let mut lx = x + 4 + title_w + 8;
-            for (i, (name, color)) in CHART_TARGETS.iter().enumerate() {
-                let v = history_set.get(i).and_then(|h| h.last().copied()).unwrap_or(0.0);
-                let label = format!("\u{25CF} {} {:.1}%", name, v);
-                SetTextColor(hdc, self.bright(*color));
-                txt(hdc, lx, y + 1, &label);
-                let lw: Vec<u16> = label.encode_utf16().collect();
-                let mut sz = SIZE { cx: 0, cy: 0 };
-                GetTextExtentPoint32W(hdc, lw.as_ptr(), lw.len() as i32, &mut sz);
-                lx += sz.cx + 8;
-            }
-
-            // Border
-            fill(hdc, x, y + (15.0 * self.scale) as i32, w, 1, C_SEP);
-
-            let plot_x = x + 4;
-            let plot_y = y + (16.0 * self.scale) as i32;
-            let plot_w = w - 8;
-            let plot_h = h - (18.0 * self.scale) as i32;
-            if plot_w < 4 || plot_h < 4 { return; }
-
-            // Y-axis labels
-            SetTextColor(hdc, self.bright(C_DIM));
-            txt(hdc, x + 4, plot_y + plot_h - (12.0 * self.scale) as i32, "0");
-            let max_label = format!("{:.0}", max_y);
-            txt(hdc, x + 4, plot_y, &max_label);
-
-            let n = HISTORY_LEN;
-            for (i, history) in history_set.iter().enumerate() {
-                let color = CHART_TARGETS[i].1;
-                use windows_sys::Win32::Graphics::Gdi::{CreatePen, MoveToEx, LineTo, PS_SOLID};
-                let pen = CreatePen(PS_SOLID as i32, 1, color);
-                let old_pen = SelectObject(hdc, pen as _);
-                let mut first = true;
-                for (k, &val) in history.iter().enumerate() {
-                    let px = plot_x + (k as i32 * plot_w) / (n as i32 - 1).max(1);
-                    let py = plot_y + plot_h
-                        - ((val / max_y).clamp(0.0, 1.0) * plot_h as f64) as i32;
-                    if first {
-                        MoveToEx(hdc, px, py, std::ptr::null_mut());
-                        first = false;
-                    } else {
-                        LineTo(hdc, px, py);
-                    }
-                }
-                SelectObject(hdc, old_pen);
-                DeleteObject(pen as _);
-            }
-        }
-
-        fn drain_samples(&mut self) {
-            let Some(rx) = self.sample_rx.as_ref() else { return };
-            while let Ok((cpu, ram, counts)) = rx.try_recv() {
-                for i in 0..CHART_TARGETS.len() {
-                    let prev_cpu = std::mem::take(&mut self.cpu_history[i]);
-                    self.cpu_history[i] = prev_cpu.into_iter().skip(1)
-                        .chain(std::iter::once(cpu[i])).collect();
-                    let prev_ram = std::mem::take(&mut self.ram_history[i]);
-                    self.ram_history[i] = prev_ram.into_iter().skip(1)
-                        .chain(std::iter::once(ram[i])).collect();
-                }
-                self.proc_counts = counts;
-            }
-        }
-
         fn rebuild_fonts(&mut self) {
             unsafe {
                 if !self.font.is_null()   { DeleteObject(self.font as _); }
@@ -304,14 +224,9 @@ mod win {
 
         fn ftr_row(&self) -> i32 { (17.0 * self.scale) as i32 }
 
-        fn chart_h(&self) -> i32 {
-            if self.show_charts { (90.0 * self.scale) as i32 } else { 0 }
-        }
-
         fn board_h(&self) -> i32 {
             self.hdr_h() + 1 + self.col_h() + 1
                 + (self.sessions.len().max(1) as i32) * self.row_h()
-                + 1 + self.chart_h()
                 + 1 + self.ftr_row()
                 + (4.0 * self.scale) as i32
         }
@@ -353,11 +268,6 @@ mod win {
             self.resize_window();
         }
 
-        fn toggle_charts(&mut self) {
-            self.show_charts = !self.show_charts;
-            self.resize_window();
-        }
-
         fn toggle_subagents(&mut self) {
             self.show_subagents = !self.show_subagents;
             self.apply_filter();
@@ -369,12 +279,39 @@ mod win {
             // 2. subagent filter
             // 3. cap at MAX_SESSIONS rows
             // 4. compute (N) suffix labels on the visible set
+            //
+            // Real-time state from the filesystem watcher: if a JSONL was
+            // written within the last few seconds, that session is currently
+            // streaming ("cooking"). Between 5–900s it's waiting for user.
+            let watch_snap: HashMap<String, std::time::Instant> = self.watch_map.lock()
+                .ok().map(|m| m.clone()).unwrap_or_default();
+            let now_inst = std::time::Instant::now();
+
             let mut filtered: Vec<Session> = self.all_sessions.iter()
-                .filter(|s| self.show_all || s.active)
+                .filter(|s| self.show_all || s.active || s.waiting)
                 .filter(|s| self.show_subagents || !s.is_subagent)
                 .take(MAX_SESSIONS)
                 .cloned()
                 .collect();
+
+            // Overlay watcher data: convert "watch saw a write recently" into
+            // active/waiting flags. Sessions whose JSONL was written <5s ago
+            // are cooking (active+green); 5s..15min ago are waiting (yellow).
+            for s in &mut filtered {
+                if let Some(last_write) = watch_snap.get(&s.session_id) {
+                    let secs = now_inst.duration_since(*last_write).as_secs();
+                    if secs < 5 {
+                        s.active = true;
+                        s.waiting = false;
+                    } else if secs < (ACTIVE_MINS as u64) * 60 {
+                        s.active = true;
+                        s.waiting = true;
+                    } else {
+                        s.active = false;
+                        s.waiting = false;
+                    }
+                }
+            }
 
             // Recompute duplicate counts on the filtered list.
             let mut project_total: HashMap<String, u32> = HashMap::new();
@@ -405,8 +342,10 @@ mod win {
 
         fn on_timer(&mut self) {
             self.tick = self.tick.wrapping_add(1);
-            self.drain_samples();
             self.drain_snapshots();
+            // Re-apply filters every tick so watcher updates (cooking → waiting
+            // transitions, new file appearing) flow into the UI within ~1s.
+            self.apply_filter();
             unsafe {
                 let hdc = GetDC(self.hwnd);
                 if !hdc.is_null() { self.render(hdc); ReleaseDC(self.hwnd, hdc); }
@@ -426,12 +365,7 @@ mod win {
         let month_start = now.format("%Y%m01").to_string();
         let today_str = now.format("%Y-%m-%d").to_string();
 
-        let Ok(mo) = std::process::Command::new("cmd")
-            .args(["/c", "tu", "daily", "-j", "--since", &month_start])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output() else { return 0.0 };
-        let raw = if !mo.stdout.is_empty() { mo.stdout } else { mo.stderr };
-        let Ok(jm) = serde_json::from_slice::<serde_json::Value>(&raw) else { return 0.0 };
+        let Some(jm) = run_tu_json(&["daily", "-j", "--since", &month_start]) else { return 0.0 };
         let Some(arr) = jm["daily"].as_array() else { return 0.0 };
         arr.iter()
             .filter(|d| d["date"].as_str().map(|s| s < today_str.as_str()).unwrap_or(false))
@@ -442,7 +376,7 @@ mod win {
     /// Read today's cost from tu's live-frame-cache.json — tiny file,
     /// already maintained by `tu live`, no subprocess needed.
     fn read_today_cost() -> f64 {
-        let path = r"C:\Users\mike2\AppData\Local\tokenusage\live-frame-cache.json";
+        let path = tokenusage_cache_path();
         let Ok(raw) = std::fs::read(path) else { return 0.0 };
         let Ok(j) = serde_json::from_slice::<serde_json::Value>(&raw) else { return 0.0 };
         j["today_totals"]["cost_usd"].as_f64().unwrap_or(0.0)
@@ -453,12 +387,7 @@ mod win {
     /// less frequently than the rest.
     fn build_snapshot(mtd_cost: f64) -> Option<Snapshot> {
         let today_str = chrono::Local::now().format("%Y%m%d").to_string();
-        let out = std::process::Command::new("cmd")
-            .args(["/c", "tu", "session", "-j", "--since", &today_str])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output().ok()?;
-        let raw = if !out.stdout.is_empty() { out.stdout } else { out.stderr };
-        let json: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        let json = run_tu_json(&["session", "-j", "--since", &today_str])?;
         let now = chrono::Local::now().naive_local();
 
             struct ProjEntry {
@@ -550,6 +479,7 @@ mod win {
                     source,
                     project: trunc(&project, 18),
                     project_full: project.clone(),
+                    session_id: e.session_id.clone(),
                     model:   e.model,
                     run,
                     last:    fmt_ago(&e.last_dt, &now),
@@ -571,7 +501,7 @@ mod win {
     /// Read the live-frame-cache.json that `tu live` produces and turn it into
     /// the colored footer segments. Tiny file, safe to read every iteration.
     fn build_footer_segs(mtd_cost: f64) -> Vec<(String, u32)> {
-        let cache = r"C:\Users\mike2\AppData\Local\tokenusage\live-frame-cache.json";
+        let cache = tokenusage_cache_path();
         let Ok(raw) = std::fs::read(cache) else { return Vec::new(); };
         let Ok(j) = serde_json::from_slice::<serde_json::Value>(&raw)
             else { return Vec::new(); };
@@ -648,6 +578,68 @@ mod win {
             }
         });
         (rx, stop)
+    }
+
+    fn tokenusage_cache_path() -> std::path::PathBuf {
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        std::path::PathBuf::from(home)
+            .join("AppData")
+            .join("Local")
+            .join("tokenusage")
+            .join("live-frame-cache.json")
+    }
+
+    fn run_tu_json(args: &[&str]) -> Option<serde_json::Value> {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.arg("/c").arg("tu").args(args);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let out = run_with_timeout(cmd, Duration::from_secs(TU_TIMEOUT_SECS))?;
+        let raw = if !out.stdout.is_empty() { out.stdout } else { out.stderr };
+        serde_json::from_slice(&raw).ok()
+    }
+
+    fn run_with_timeout(
+        mut cmd: std::process::Command,
+        timeout: Duration,
+    ) -> Option<std::process::Output> {
+        use std::fs::File;
+        use std::process::Stdio;
+
+        let stamp = chrono::Local::now().timestamp_nanos_opt().unwrap_or_default();
+        let base = std::env::temp_dir();
+        let stdout_path = base.join(format!("ai-board-tu-{}-{}.out", std::process::id(), stamp));
+        let stderr_path = base.join(format!("ai-board-tu-{}-{}.err", std::process::id(), stamp));
+        let stdout_file = File::create(&stdout_path).ok()?;
+        let stderr_file = File::create(&stderr_path).ok()?;
+
+        cmd.stdout(Stdio::from(stdout_file)).stderr(Stdio::from(stderr_file));
+        let mut child = cmd.spawn().ok()?;
+        let start = Instant::now();
+        loop {
+            if child.try_wait().ok()?.is_some() {
+                let status = child.wait().ok()?;
+                let stdout = std::fs::read(&stdout_path).unwrap_or_default();
+                let stderr = std::fs::read(&stderr_path).unwrap_or_default();
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return Some(std::process::Output { status, stdout, stderr });
+            }
+            if start.elapsed() >= timeout {
+                kill_process_tree(child.id());
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn kill_process_tree(pid: u32) {
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/T", "/F", "/PID", &pid.to_string()]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let _ = cmd.output();
     }
 
     impl BoardApp {
@@ -784,30 +776,8 @@ mod win {
                             if s.active { "\u{25CF}" } else { "\u{25CB}" });
                     }
                 }
-                // ── Charts (CPU / RAM) ───────────────────────────────────
-                let y_after_rows = y_data + (self.sessions.len().max(1) as i32) * rh;
-                let mut y_chart_end = y_after_rows;
-                if self.show_charts {
-                    fill(hdc, 0, y_after_rows, bw, 1, C_SEP);
-                    let ch_h = self.chart_h();
-                    let half_w = bw / 2;
-                    // Shared Y scale across CPU and RAM so the 0 baseline and
-                    // visual scale match. Floor at 20% so small values remain
-                    // visible without the line glued to the bottom edge.
-                    let max_cpu = self.cpu_history.iter()
-                        .flat_map(|h| h.iter().copied())
-                        .fold(0.0_f64, f64::max);
-                    let max_ram = self.ram_history.iter()
-                        .flat_map(|h| h.iter().copied())
-                        .fold(0.0_f64, f64::max);
-                    let shared_max = max_cpu.max(max_ram).ceil().max(20.0);
-                    self.draw_chart(hdc, 0, y_after_rows + 1, half_w, ch_h, true, shared_max);
-                    self.draw_chart(hdc, half_w, y_after_rows + 1, bw - half_w, ch_h, false, shared_max);
-                    y_chart_end = y_after_rows + 1 + ch_h;
-                }
-
                 // ── Footer ───────────────────────────────────────────────
-                let y_sep = y_chart_end;
+                let y_sep = y_data + (self.sessions.len().max(1) as i32) * rh;
                 fill(hdc, 0, y_sep, bw, 1, C_SEP);
                 SelectObject(hdc, self.font as HGDIOBJ);
                 if !self.footer_segs.is_empty() {
@@ -938,55 +908,66 @@ mod win {
         s.replace('-', "/")
     }
 
-    /// Spawn a 1Hz background thread that samples CPU% and RAM% (as % of total
-    /// system memory) for processes whose name contains one of CHART_TARGETS.
-    /// Each tick sends `(cpu_pcts, ram_pcts, counts)` for the targets via channel.
-    fn spawn_proc_sampler() -> (
-        std::sync::mpsc::Receiver<(Vec<f64>, Vec<f64>, Vec<usize>)>,
-        std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        use std::sync::atomic::{AtomicBool, Ordering};
+    /// Spawn a filesystem watcher on `~/.claude/projects/` recursively. Every
+    /// time Claude appends to a JSONL, the OS notifies us; we record the
+    /// session_id (= relative path without .jsonl) → Instant in the map.
+    /// The UI thread reads this map to flip rows into "cooking" within ms,
+    /// without any polling.
+    fn spawn_jsonl_watcher(map: std::sync::Arc<WatchMap>)
+        -> std::sync::Arc<std::sync::atomic::AtomicBool>
+    {
+        use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+        use std::time::Instant;
         let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel();
         let stop_w = stop.clone();
         std::thread::spawn(move || {
-            // new_all() primes total_memory(); without it RAM% divides by zero.
-            let mut sys = sysinfo::System::new_all();
-            // Per-tick refresh: only CPU + memory. Skipping disk/exe/env/cwd
-            // saves >70% of the sampler's CPU cost on Windows.
-            let kind = ProcessRefreshKind::new().with_cpu().with_memory();
-            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
-            let total_ram_mb = sys.total_memory() as f64 / 1024.0 / 1024.0;
-            let core_count = sys.cpus().len().max(1) as f64;
-            loop {
-                if stop_w.load(Ordering::Relaxed) { break; }
-                // 2s instead of 1s — chart still smooth, halves the CPU.
-                std::thread::sleep(Duration::from_millis(2000));
-                sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
-                let n = CHART_TARGETS.len();
-                let mut cpu = vec![0.0f64; n];
-                let mut ram = vec![0.0f64; n];
-                let mut counts = vec![0usize; n];
-                for proc in sys.processes().values() {
-                    let name = proc.name().to_string_lossy().to_lowercase();
-                    for (i, (target, _)) in CHART_TARGETS.iter().enumerate() {
-                        if name.contains(target) {
-                            cpu[i] += proc.cpu_usage() as f64 / core_count;
-                            let rss_mb = proc.memory() as f64 / 1024.0 / 1024.0;
-                            if total_ram_mb > 0.0 {
-                                ram[i] += rss_mb / total_ram_mb * 100.0;
-                            }
-                            counts[i] += 1;
-                            break;
+            use notify::{Watcher, RecursiveMode, EventKind};
+            let Ok(home) = std::env::var("USERPROFILE") else { return };
+            let projects_root = std::path::PathBuf::from(home)
+                .join(".claude").join("projects");
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut watcher = match notify::recommended_watcher(move |res| {
+                let _ = tx.send(res);
+            }) {
+                Ok(w) => w,
+                Err(_) => return,
+            };
+            if watcher.watch(&projects_root, RecursiveMode::Recursive).is_err() {
+                return;
+            }
+
+            // Codex sessions live elsewhere; watch that too if present.
+            let _ = std::env::var("USERPROFILE").ok().map(|h| {
+                let codex_root = std::path::PathBuf::from(h).join(".codex").join("sessions");
+                let _ = watcher.watch(&codex_root, RecursiveMode::Recursive);
+            });
+
+            for evt in rx {
+                if stop_w.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                let Ok(event) = evt else { continue };
+                if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) { continue; }
+                for path in &event.paths {
+                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+                    if let Some(session_id) = session_id_from_path(path, &projects_root) {
+                        if let Ok(mut m) = map.lock() {
+                            m.insert(session_id, Instant::now());
                         }
                     }
                 }
-                if tx.send((cpu, ram, counts)).is_err() { break; }
             }
         });
-        (rx, stop)
+        stop
+    }
+
+    /// Convert an absolute JSONL path back into the `session_id` form tu uses.
+    /// e.g. `~/.claude/projects/d--code-x/UUID.jsonl` → `d--code-x/UUID`
+    ///      `.../d--code-x/UUID/subagents/agent-y.jsonl` → `d--code-x/UUID/subagents/agent-y`
+    fn session_id_from_path(path: &std::path::Path, root: &std::path::Path) -> Option<String> {
+        let rel = path.strip_prefix(root).ok()?;
+        let s = rel.with_extension("").to_string_lossy().replace('\\', "/");
+        if s.is_empty() { None } else { Some(s) }
     }
 
     fn raw_source(v: &serde_json::Value) -> String {
@@ -1087,17 +1068,13 @@ mod win {
         let menu = CreatePopupMenu();
         if menu.is_null() { return; }
 
-        let (opacity, scale, show_all, show_charts, brightness, show_subagents) = app_ref(hwnd)
-            .map(|a| (a.opacity, a.scale, a.show_all, a.show_charts, a.brightness, a.show_subagents))
-            .unwrap_or((255, 1.0, false, true, 1.0, false));
+        let (opacity, scale, show_all, brightness, show_subagents) = app_ref(hwnd)
+            .map(|a| (a.opacity, a.scale, a.show_all, a.brightness, a.show_subagents))
+            .unwrap_or((255, 1.0, false, 1.0, false));
 
         // Toggle 24h / active-only
         let toggle_label = if show_all { "表示: 24H \u{2714}" } else { "表示: Active Only" };
         AppendMenuW(menu, MF_STRING, MENU_TOGGLE_ALL, wide(toggle_label).as_ptr());
-
-        // Toggle CPU/RAM charts
-        let chart_label = if show_charts { "Charts: ON \u{2714}" } else { "Charts: OFF" };
-        AppendMenuW(menu, MF_STRING, MENU_TOGGLE_CHARTS, wide(chart_label).as_ptr());
 
         // Toggle subagent visibility
         let sub_label = if show_subagents { "Subagents: ON \u{2714}" } else { "Subagents: OFF" };
@@ -1193,7 +1170,6 @@ mod win {
                 match id {
                     MENU_CLOSE        => { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd); }
                     MENU_TOGGLE_ALL   => { if let Some(a) = app_mut(hwnd) { a.toggle_show_all(); } }
-                    MENU_TOGGLE_CHARTS => { if let Some(a) = app_mut(hwnd) { a.toggle_charts(); } }
                     MENU_TOGGLE_SUBAG  => { if let Some(a) = app_mut(hwnd) { a.toggle_subagents(); } }
                     MENU_OPACITY_40   => { if let Some(a) = app_mut(hwnd) { a.set_opacity(102); } }
                     MENU_OPACITY_70   => { if let Some(a) = app_mut(hwnd) { a.set_opacity(178); } }
