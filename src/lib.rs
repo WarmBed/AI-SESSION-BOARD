@@ -12,6 +12,7 @@
 
 pub mod widget;
 pub mod tui;
+pub mod quota;
 
 /// Launch the Win32 floating overlay (Windows-only).
 pub fn run_floating() { widget::run(); }

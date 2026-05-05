@@ -507,30 +507,36 @@ mod win {
         Some(Snapshot { all_sessions, footer_segs, mtd_cost })
     }
 
-    /// Read the live-frame-cache.json that `tu live` produces and turn it into
-    /// the colored footer segments. Tiny file, safe to read every iteration.
+    /// Build the colored footer segments. Quota percentages come from the
+    /// official Anthropic / ChatGPT OAuth APIs (cached for 60s) so they stay
+    /// fresh regardless of whether `tu live` is running. Today's cost comes
+    /// from tu's tiny live-frame-cache.json.
     fn build_footer_segs(mtd_cost: f64) -> Vec<(String, u32)> {
+        // tu's tiny cache — only used now for today's cost and reset_at hint.
+        let mut today = 0.0_f64;
+        let mut reset_at_cache: Option<i64> = None;
         let cache = tokenusage_cache_path();
-        let Ok(raw) = std::fs::read(cache) else { return Vec::new(); };
-        let Ok(j) = serde_json::from_slice::<serde_json::Value>(&raw)
-            else { return Vec::new(); };
+        if let Ok(raw) = std::fs::read(cache) {
+            if let Ok(j) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                today = j["today_totals"]["cost_usd"].as_f64().unwrap_or(0.0);
+                reset_at_cache = j["official_claude"]["primary_resets_at"].as_i64();
+            }
+        }
 
-        let cla_pct  = j["official_claude"]["primary_used_percent"].as_f64().unwrap_or(0.0);
-        let cla_wk   = j["official_claude"]["secondary_used_percent"].as_f64().unwrap_or(0.0);
-        let cod_pct  = j["official_codex"]["primary_used_percent"].as_f64().unwrap_or(0.0);
-        let cod_wk   = j["official_codex"]["secondary_used_percent"].as_f64().unwrap_or(0.0);
-        let today    = j["today_totals"]["cost_usd"].as_f64().unwrap_or(0.0);
+        // Live quota from OAuth APIs, throttled to once per minute.
+        let quota = cached_quota();
 
-        let reset_at = j["official_claude"]["primary_resets_at"].as_i64().unwrap_or(0);
+        let cla_pct = quota.claude_primary_pct.unwrap_or(0.0);
+        let cla_wk  = quota.claude_secondary_pct.unwrap_or(0.0);
+        let cod_pct = quota.codex_primary_pct.unwrap_or(0.0);
+        let cod_wk  = quota.codex_secondary_pct.unwrap_or(0.0);
+
         let now_unix = chrono::Local::now().timestamp();
+        let reset_at = quota.claude_resets_at.or(reset_at_cache).unwrap_or(0);
         let left = (reset_at - now_unix).max(0);
         let reset = if left >= 3600 {
             format!("{}h{}m", left / 3600, (left % 3600) / 60)
         } else { format!("{}m", left / 60) };
-
-        let cached = j["cached_at_unix"].as_i64().unwrap_or(0);
-        let age_m = (now_unix - cached) / 60;
-        let stale = if age_m > 5 { format!(" !{}m", age_m) } else { String::new() };
 
         vec![
             ("CC ".into(),                          C_HDR),
@@ -541,9 +547,30 @@ mod win {
             (format!("{:.0}%", cod_pct),            pct_color(cod_pct)),
             ("/wk".into(),                          C_HDR),
             (format!("{:.0}%", cod_wk),             pct_color(cod_wk)),
-            (format!("  RST {}  今${:.0}  MTD${}{}",
-                reset, today, fmt_kilo(mtd_cost), stale), C_HDR),
+            (format!("  RST {}  今${:.0}  MTD${}",
+                reset, today, fmt_kilo(mtd_cost)), C_HDR),
         ]
+    }
+
+    /// Cache OAuth-fetched quota for 60s so the build_snapshot worker doesn't
+    /// hammer the API on every refresh.
+    fn cached_quota() -> super::super::quota::QuotaSnapshot {
+        use std::sync::OnceLock;
+        use std::sync::Mutex;
+        use std::time::Instant;
+        static CACHE: OnceLock<Mutex<Option<(Instant, super::super::quota::QuotaSnapshot)>>>
+            = OnceLock::new();
+        let cell = CACHE.get_or_init(|| Mutex::new(None));
+        if let Ok(guard) = cell.lock() {
+            if let Some((t, snap)) = &*guard {
+                if t.elapsed() < Duration::from_secs(60) { return snap.clone(); }
+            }
+        }
+        let snap = super::super::quota::fetch_quota_now();
+        if let Ok(mut guard) = cell.lock() {
+            *guard = Some((Instant::now(), snap.clone()));
+        }
+        snap
     }
 
     /// Background worker thread — produces snapshots every REFRESH_SECS without

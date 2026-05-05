@@ -480,17 +480,12 @@ fn do_fetch(st: &mut Snapshot, show_all: bool) {
 }
 
 fn refresh_quota(st: &mut Snapshot) {
-    let path = format!(
-        "{}\\AppData\\Local\\tokenusage\\live-frame-cache.json",
-        std::env::var("USERPROFILE").unwrap_or_default()
-    );
-    let Ok(raw) = std::fs::read(&path) else { return; };
-    let Ok(j) = serde_json::from_slice::<serde_json::Value>(&raw) else { return; };
-
-    let cla_pct = j["official_claude"]["primary_used_percent"].as_f64().unwrap_or(0.0);
-    let cla_wk  = j["official_claude"]["secondary_used_percent"].as_f64().unwrap_or(0.0);
-    let cod_pct = j["official_codex"]["primary_used_percent"].as_f64().unwrap_or(0.0);
-    let cod_wk  = j["official_codex"]["secondary_used_percent"].as_f64().unwrap_or(0.0);
+    // Live OAuth quota (cached for 60s by the quota module's caller).
+    let q = cached_quota();
+    let cla_pct = q.claude_primary_pct.unwrap_or(0.0);
+    let cla_wk  = q.claude_secondary_pct.unwrap_or(0.0);
+    let cod_pct = q.codex_primary_pct.unwrap_or(0.0);
+    let cod_wk  = q.codex_secondary_pct.unwrap_or(0.0);
 
     let mut segs: Vec<(String, Color)> = Vec::new();
     segs.push((format!("CC {:.0}%/", cla_pct), pct_color(cla_pct)));
@@ -499,6 +494,22 @@ fn refresh_quota(st: &mut Snapshot) {
     segs.push((format!("CDX {:.0}%/", cod_pct), pct_color(cod_pct)));
     segs.push((format!("wk{:.0}%", cod_wk), pct_color(cod_wk)));
     st.footer_segs = segs;
+}
+
+fn cached_quota() -> super::quota::QuotaSnapshot {
+    use std::sync::OnceLock;
+    use std::sync::Mutex;
+    static CACHE: OnceLock<Mutex<Option<(Instant, super::quota::QuotaSnapshot)>>>
+        = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(g) = cell.lock() {
+        if let Some((t, s)) = &*g {
+            if t.elapsed() < Duration::from_secs(60) { return s.clone(); }
+        }
+    }
+    let snap = super::quota::fetch_quota_now();
+    if let Ok(mut g) = cell.lock() { *g = Some((Instant::now(), snap.clone())); }
+    snap
 }
 
 fn pct_color(v: f64) -> Color {
